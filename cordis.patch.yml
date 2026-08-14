@@ -1,0 +1,6 @@
+# dsh-feishu-gateway bundle patch: mounts the Feishu gateway plugin into a
+# profile layer stack. Runtime defaults live at the plugin's config boundary;
+# users override them in their profile patch row with the same id.
+- insert:
+    - id: feishu-gateway
+      name: '@dsh-external/dsh-feishu-gateway'
