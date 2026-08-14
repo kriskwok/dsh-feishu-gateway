@@ -1,5 +1,7 @@
 # dsh-feishu-gateway
 
+English | [中文](README.zh.md)
+
 Chat with your **DeepSeek Harness (DSH)** agent from **Feishu (Lark)**.
 
 A DSH plugin bundle that mounts a Feishu long-connection listener; every Feishu

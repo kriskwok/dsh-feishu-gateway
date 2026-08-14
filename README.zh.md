@@ -1,5 +1,7 @@
 # dsh-feishu-gateway
 
+[English](README.md) | 中文
+
 在**飞书（Feishu/Lark）**里与你的 **DeepSeek Harness（DSH）** agent 对话。
 
 这是一个 DSH 插件 bundle：挂载飞书长连接监听器，每条飞书消息路由到**稳定的 DSH 会话**
