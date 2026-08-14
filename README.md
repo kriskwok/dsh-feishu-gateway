@@ -51,15 +51,44 @@ fresh session, a configurable "processing" hint, and proactive push.
 
 Prerequisite: this package is published on npm and `dsh` is on your PATH.
 
-Run the one-shot script from this repository (or follow the manual steps below):
+The recommended setup **mounts the gateway into the web profile**: it runs in
+the same process as the DSH Web UI, so starting the Web UI also starts the
+Feishu gateway, and both share the same DSH agent. A standalone profile is also
+supported (see "Alternative" at the end).
 
-```bash
-./scripts/create-profile.sh
+### Option 1 (recommended): mount into the web profile
+
+The web profile is DSH's default GUI profile (`dsh --profile web`).
+
+1. Edit `~/.dsh/profiles/web/package.json` to add the dependency and bundle:
+
+```json
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {
+    "@kriskwok/dsh-feishu-gateway": "^0.1.0"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@kriskwok/dsh-feishu-gateway"
+      ]
+    }
+  }
+}
 ```
 
-Then edit the generated user config
-`~/.dsh/profiles/feishu/cordis.patch.yml` and fill in your Feishu app
-credentials:
+2. Install dependencies in the web profile directory:
+
+```bash
+cd ~/.dsh/profiles/web && pnpm install
+```
+
+3. Edit `~/.dsh/profiles/web/cordis.patch.yml` and fill in your Feishu app
+   credentials:
 
 ```yaml
 - id: feishu-gateway
@@ -72,13 +101,19 @@ credentials:
       token: your-token
 ```
 
-Start the gateway:
+4. Start (or restart) the web profile:
 
 ```bash
-dsh --profile feishu
+dsh --profile web
 ```
 
-### Manual installation
+> You can also use the one-shot script from this repository:
+> `./scripts/create-profile.sh` (mounts into the web profile by default;
+> `--standalone` creates a standalone feishu profile instead).
+
+### Alternative: standalone feishu profile
+
+To run the gateway without the Web UI, use a standalone profile:
 
 ```bash
 mkdir -p ~/.dsh/profiles/feishu && cd ~/.dsh/profiles/feishu

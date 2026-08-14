@@ -44,13 +44,42 @@ Markdown 富文本（post 消息的 md 标签）回复。支持 `/new` 开启全
 
 前提：本包已发布到 npm，且 `dsh` 命令可用。
 
-方式一（推荐）：运行本仓库的一键脚本
+推荐把网关**挂载到 web profile**：与 DSH Web UI 同进程运行，启动 Web UI
+即同时启动飞书网关，两者共用同一个 DSH agent。也可以用独立 profile 运行
+（见文末「备选」）。
 
-```bash
-./scripts/create-profile.sh
+方式一（推荐）：挂载到 web profile
+
+web profile 是 DSH 的默认图形界面 profile（`dsh --profile web`）。
+
+1. 编辑 `~/.dsh/profiles/web/package.json`，加入依赖与 bundle：
+
+```json
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": {
+    "@kriskwok/dsh-feishu-gateway": "^0.1.0"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@kriskwok/dsh-feishu-gateway"
+      ]
+    }
+  }
+}
 ```
 
-然后编辑生成的用户配置 `~/.dsh/profiles/feishu/cordis.patch.yml`，填入飞书应用凭据：
+2. 在 web profile 目录安装依赖：
+
+```bash
+cd ~/.dsh/profiles/web && pnpm install
+```
+
+3. 编辑 `~/.dsh/profiles/web/cordis.patch.yml`，填入飞书应用凭据：
 
 ```yaml
 - id: feishu-gateway
@@ -63,13 +92,18 @@ Markdown 富文本（post 消息的 md 标签）回复。支持 `/new` 开启全
       token: your-token
 ```
 
-启动网关：
+4. 启动（或重启）web profile：
 
 ```bash
-dsh --profile feishu
+dsh --profile web
 ```
 
-方式二：手动创建 profile
+> 也可以直接运行本仓库的一键脚本：`./scripts/create-profile.sh`
+> （默认挂载到 web profile；`--standalone` 则创建独立 feishu profile）。
+
+### 备选：独立 feishu profile
+
+若不想通过 Web UI 使用，可让网关在独立 profile 中运行：
 
 ```bash
 mkdir -p ~/.dsh/profiles/feishu && cd ~/.dsh/profiles/feishu
