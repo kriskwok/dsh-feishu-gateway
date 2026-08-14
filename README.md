@@ -84,11 +84,11 @@ cat > package.json <<'EOF'
   "name": "dsh-profile-feishu",
   "private": true,
   "dependencies": {
-    "@dsh-external/dsh-feishu-gateway": "^0.1.0"
+    "@kriskwok/dsh-feishu-gateway": "^0.1.0"
   },
   "dsh": {
     "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "@dsh-external/dsh-feishu-gateway"]
+      "bundles": ["@deepseek-ai/dsh-base", "@kriskwok/dsh-feishu-gateway"]
     }
   }
 }

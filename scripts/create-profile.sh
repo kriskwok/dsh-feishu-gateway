@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 PROFILE_DIR="$DSH_HOME/profiles/feishu"
-PLUGIN_NAME="@dsh-external/dsh-feishu-gateway"
+PLUGIN_NAME="@kriskwok/dsh-feishu-gateway"
 PLUGIN_DIR="$(pwd)"
 
 echo "==> 创建 profile 目录: $PROFILE_DIR"
