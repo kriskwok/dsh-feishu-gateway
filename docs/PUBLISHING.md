@@ -11,12 +11,12 @@
 
 ## 2. package.json 元数据
 
-⚠️ **必改**：`repository` / `bugs` / `homepage` 目前是 `<your-org>` 占位。
-发布前替换为你的真实 GitHub 仓库地址。
+✅ **已完成**：`repository` / `bugs` / `homepage` 已指向
+https://github.com/kriskwok/dsh-feishu-gateway
 
-⚠️ **必改（补回 peerDependencies）**：本地开发时为了避免 pnpm 解析
-`@deepseek-ai/*`（它们不在 npm 上单独可装），package.json 中暂未声明
-peerDependencies。发布前按 DSH 官方 bundle 规范补回：
+✅ **已完成（peerDependencies）**：已按 DSH 官方 bundle 规范补回：
+（与 `@dsh-external/dsh-vision-toolkit` 的声明方式一致。用户 profile 使用
+`autoInstallPeers: false`，因此 peer 由 DSH 宿主解析，不会触发 npm 404。）
 
 ```jsonc
 "peerDependencies": {
