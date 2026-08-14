@@ -1,5 +1,9 @@
 # dsh-feishu-gateway
 
+[![npm version](https://img.shields.io/npm/v/@kriskwok/dsh-feishu-gateway)](https://www.npmjs.com/package/@kriskwok/dsh-feishu-gateway)
+[![License: MIT](https://img.shields.io/npm/l/@kriskwok/dsh-feishu-gateway)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/kriskwok/dsh-feishu-gateway)](https://github.com/kriskwok/dsh-feishu-gateway)
+
 English | [中文](README.zh.md)
 
 Chat with your **DeepSeek Harness (DSH)** agent from **Feishu (Lark)**.
