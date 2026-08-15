@@ -171,11 +171,38 @@ async function testChatHandler(): Promise<void> {
   await handler.handleMessage(p2p)
   ok('stream：先加 Typing 表情', calls.some((c) => c.kind === 'addReaction' && c.args[1] === 'Typing'))
   ok('stream：发送流式卡片', calls.some((c) => c.kind === 'replyCard'))
+  const streamCard = calls.find((c) => c.kind === 'replyCard')?.args[1] as
+    | { header?: { title?: { content?: string }; template?: string } }
+    | undefined
+  ok('stream：默认处理中标题', streamCard?.header?.title?.content === '🤖 DSH 处理中…', `got=${streamCard?.header?.title?.content}`)
+  ok('stream：处理中卡片为黄色', streamCard?.header?.template === 'yellow', `got=${streamCard?.header?.template}`)
   ok('stream：resume 会话', resumeCount === 1)
   ok('stream：最终 Markdown 答复', calls.some((c) => c.kind === 'replyMarkdown' && c.args[1] === '这是 DSH 的最终答复。'))
   ok('stream：移除 Typing 表情', calls.some((c) => c.kind === 'removeReaction'))
   ok('stream：卡片完成态 patch', calls.some((c) => c.kind === 'patchCard'))
+  const doneCard = calls.find((c) => c.kind === 'patchCard')?.args[1] as
+    | { header?: { title?: { content?: string }; template?: string } }
+    | undefined
+  ok('stream：默认完成标题', doneCard?.header?.title?.content === '🤖 DSH 处理完成', `got=${doneCard?.header?.title?.content}`)
+  ok('stream：完成卡片为绿色', doneCard?.header?.template === 'green', `got=${doneCard?.header?.template}`)
   ok('stream：不再发提示语', !calls.some((c) => c.kind === 'replyText' && String(c.args[1]).includes('正在努力处理')))
+
+  // --- 可配置卡片标题 ---
+  calls.length = 0
+  const handlerTitled = new ChatHandler({
+    ctx,
+    config: resolveConfig({
+      ...baseConfig,
+      reporting: { cardTitleStreaming: '💭 爸爸想想…', cardTitleDone: '✅ 爸爸答完了' },
+    }),
+    feishu: feishuMock,
+    sessions: new SessionMap(file),
+  })
+  await handlerTitled.handleMessage(p2p)
+  const titledCard = calls.find((c) => c.kind === 'replyCard')?.args[1] as
+    | { header?: { title?: { content?: string } } }
+    | undefined
+  ok('标题可配置：处理中文案生效', titledCard?.header?.title?.content === '💭 爸爸想想…', `got=${titledCard?.header?.title?.content}`)
 
   // --- final 模式：无卡片，只有 Typing + 最终答复 ---
   calls.length = 0

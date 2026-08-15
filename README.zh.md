@@ -169,6 +169,8 @@ dsh --profile feishu
 | `reporting.patchIntervalMs` | `700` | 卡片刷新最小间隔（毫秒，飞书有限流） |
 | `reporting.maxBodyChars` | `900` | 卡片正文最大渲染长度 |
 | `reporting.failureReaction` | `CrossMark` | 失败时（移除 Typing 后）追加的表情 |
+| `reporting.cardTitleStreaming` | `🤖 DSH 处理中…` | 处理中卡片标题（黄色头）可自定义 |
+| `reporting.cardTitleDone` | `🤖 DSH 处理完成` | 完成卡片标题（绿色头）可自定义 |
 | `interactions.approvalCards` | `true` | 权限审批用可点击卡片回答 |
 | `interactions.userQuestionsCards` | `true` | `ask_user_question` 用可点击卡片回答 |
 | `newSessionPatterns` | `/new` 及中文短语 | 触发另起会话的正则列表 |

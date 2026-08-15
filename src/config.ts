@@ -59,6 +59,10 @@ export interface FeishuGatewayConfig {
     maxBodyChars?: number
     /** Emoji reaction added on failure instead of Typing (hermes-style). */
     failureReaction?: string
+    /** Custom title of the streaming card while the agent is working. */
+    cardTitleStreaming?: string
+    /** Custom title of the streaming card when the turn completes. */
+    cardTitleDone?: string
   }
   /**
    * Interactive card answering for in-conversation Q&A: permission approvals
@@ -101,6 +105,8 @@ export const Config: Schema<FeishuGatewayConfig> = z.object({
     patchIntervalMs: z.number().default(700),
     maxBodyChars: z.number().default(900),
     failureReaction: z.string().default('CrossMark'),
+    cardTitleStreaming: z.string().default('🤖 DSH 处理中…'),
+    cardTitleDone: z.string().default('🤖 DSH 处理完成'),
   }),
   interactions: z.object({
     approvalCards: z.boolean().default(true),

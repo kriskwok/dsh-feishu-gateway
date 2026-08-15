@@ -50,6 +50,8 @@ export class TurnReporter {
   private readonly maxBodyChars: number
   private readonly showReasoning: boolean
   private readonly showToolCalls: boolean
+  private readonly titleStreaming: string
+  private readonly titleDone: string
 
   constructor(
     private readonly deps: TurnReporterDeps,
@@ -60,6 +62,8 @@ export class TurnReporter {
     this.maxBodyChars = Math.max(200, reporting.maxBodyChars ?? 900)
     this.showReasoning = reporting.showReasoning ?? true
     this.showToolCalls = reporting.showToolCalls ?? true
+    this.titleStreaming = reporting.cardTitleStreaming ?? '🤖 DSH 处理中…'
+    this.titleDone = reporting.cardTitleDone ?? '🤖 DSH 处理完成'
   }
 
   /** Send the initial card and stream a brief "starting" state. */
@@ -225,8 +229,9 @@ export class TurnReporter {
     return {
       config: { wide_screen_mode: true, streaming_mode: streaming },
       header: {
-        title: { tag: 'plain_text', content: streaming ? '🤖 DSH 处理中…' : '🤖 DSH 处理完成' },
-        template: streaming ? 'blue' : 'green',
+        title: { tag: 'plain_text', content: streaming ? this.titleStreaming : this.titleDone },
+        // 处理中：黄色；完成：绿色。
+        template: streaming ? 'yellow' : 'green',
       },
       elements,
     }

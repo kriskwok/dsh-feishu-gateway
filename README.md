@@ -186,6 +186,8 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 | `reporting.patchIntervalMs` | `700` | Min interval between card patches (Feishu rate limit) |
 | `reporting.maxBodyChars` | `900` | Max rendered card body length |
 | `reporting.failureReaction` | `CrossMark` | Reaction added on failure (after removing `Typing`) |
+| `reporting.cardTitleStreaming` | `🤖 DSH 处理中…` | Custom title of the streaming card while working (yellow header) |
+| `reporting.cardTitleDone` | `🤖 DSH 处理完成` | Custom title of the streaming card when complete (green header) |
 | `interactions.approvalCards` | `true` | Answer permission approvals with clickable cards |
 | `interactions.userQuestionsCards` | `true` | Answer `ask_user_question` with clickable cards |
 | `newSessionPatterns` | `/new` + Chinese phrases | Regexes that reset the session |
