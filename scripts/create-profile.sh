@@ -72,7 +72,11 @@ EOF
       # botOpenId: ou_xxx       # 可选，@ 自动识别可留空
       # replyMode: at           # at=仅被@回复 | all=全部回复
     # workspace: ~/Documents/DSH-Workspace   # agent 工作目录
-    # hintText: 爸爸，我正在努力处理中……      # 处理中提示语
+    # hintText: 爸爸，我正在努力处理中……      # 兜底提示语（Typing 表情不可用时）
+    # reporting:
+    #   mode: stream                # stream=流式进度卡片（默认） final=只显示最终结果
+    # interactions:
+    #   approvalCards: true         # 权限审批用飞书卡片点击即答
     # http:
     #   port: 3100              # 管理 API 端口（0=禁用）
     #   token: your-token       # 管理 API Bearer Token
@@ -147,7 +151,11 @@ EOF
       # botOpenId: ou_xxx       # 可选，@ 自动识别可留空
       # replyMode: at           # at=仅被@回复 | all=全部回复
     # workspace: ~/Documents/DSH-Workspace   # agent 工作目录
-    # hintText: 爸爸，我正在努力处理中……      # 处理中提示语
+    # hintText: 爸爸，我正在努力处理中……      # 兜底提示语（Typing 表情不可用时）
+    # reporting:
+    #   mode: stream                # stream=流式进度卡片（默认） final=只显示最终结果
+    # interactions:
+    #   approvalCards: true         # 权限审批用飞书卡片点击即答
     # http:
     #   port: 3100              # 管理 API 端口（0=禁用）
     #   token: your-token       # 管理 API Bearer Token

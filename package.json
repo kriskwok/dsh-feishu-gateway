@@ -1,7 +1,7 @@
 {
   "name": "@kriskwok/dsh-feishu-gateway",
-  "version": "0.1.1",
-  "description": "DeepSeek Harness-native Feishu (Lark) gateway: chat with the DSH agent from Feishu via long connection, with persistent sessions, /new, Markdown replies, and proactive push.",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness-native Feishu (Lark) gateway: chat with the DSH agent from Feishu via long connection, with persistent sessions, /new, Markdown replies, live streaming progress cards, native Typing reactions, click-to-answer approval / Q&A cards, and proactive push.",
   "keywords": [
     "deepseek",
     "deepseek-harness",
@@ -68,6 +68,8 @@
     "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1 <0.2.0",
     "@deepseek-ai/dsh-session": ">=0.0.1-rc.1 <0.2.0",
     "@deepseek-ai/dsh-settings": ">=0.0.1-rc.1 <0.2.0",
+    "@deepseek-ai/dsh-user-approval": ">=0.0.1-rc.1 <0.2.0",
+    "@deepseek-ai/dsh-user-questions": ">=0.0.1-rc.1 <0.2.0",
     "@deepseek-ai/schemastery": ">=3.18.0 <4.0.0"
   },
   "peerDependenciesMeta": {
@@ -75,6 +77,12 @@
       "optional": true
     },
     "@deepseek-ai/dsh-settings": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-user-approval": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-user-questions": {
       "optional": true
     }
   },

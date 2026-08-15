@@ -9,15 +9,25 @@
 在**飞书（Feishu/Lark）**里与你的 **DeepSeek Harness（DSH）** agent 对话。
 
 这是一个 DSH 插件 bundle：挂载飞书长连接监听器，每条飞书消息路由到**稳定的 DSH 会话**
-（通过 `agents` 服务的 resume 恢复，多轮对话保持在同一个会话），agent 的最终答复以
-Markdown 富文本（post 消息的 md 标签）回复。支持 `/new` 开启全新会话、可配置的
-"处理中"提示语、以及主动推送。
+（通过 `agents` 服务的 resume 恢复，多轮对话保持在同一个会话），agent 的答复以
+Markdown 富文本（post 消息的 md 标签）回复。支持 `/new` 开启全新会话、
+原生 **Typing 表情**处理中指示、长任务的**流式进度卡片**、权限审批与
+`ask_user_question` 的**点击即答卡片**、以及主动推送。
 
 ## 功能
 
 - 💬 **完整对话** — 飞书私聊 / 群聊 @机器人 → DSH agent → 回复
 - 🔁 **会话保持** — 每个飞书会话对应一个 DSH 会话（`agents.resume` / `agents.create`）；
   发 `/new`（或"另起会话 / 新会话 / 重新开始 / 换个话题"）开启全新会话
+- ⌨️ **原生 Typing 指示** — 处理期间机器人在你的消息上加一个 `Typing` 表情回复
+  （同 [hermes-agent 的飞书网关](https://github.com/NousResearch/hermes-agent)），
+  回答未结束就一直显示，失败时换成 `CrossMark`。默认不再发"思考中…"提示语。
+- 🎞 **流式汇报** — 长任务持续汇报：一张实时交互卡片流式显示 agent 的
+  **思考、工具调用、回答草稿**（`reporting.mode: 'stream'`，默认开启）；
+  设为 `reporting.mode: 'final'` 则只显示最终结果。
+- 🃏 **点击即答卡片** — 权限审批（`approval/request`，如沙箱提权）与模型的
+  `ask_user_question` 工具会渲染成飞书交互卡片：点 **✅ 允许一次 / 🚫 拒绝**
+  或选项按钮即可作答。
 - ✍️ **Markdown 回复** — 用普通富文本（post）消息的 `md` 标签：粗体、行内代码、
   列表、链接原生渲染，无需卡片
 - 🤖 **完整 agent 能力** — DSH agent 自带模型与工具（bash、文件、子代理…），完全自主
@@ -38,7 +48,11 @@ Markdown 富文本（post 消息的 md 标签）回复。支持 `/new` 开启全
 3. 开通权限：`im:message`、`im:message:send_as_bot`（如需读取消息内容再加
    `im:message:send_as_bot:readonly`），然后创建版本并发布。
 4. 事件与回调 → 选择**使用长连接接收事件**，订阅 **`im.message.receive_v1`**（无需公网）。
+   审批/问答卡片的**按钮点击**（`card.action.trigger`）也走同一条长连接，无需回调地址。
 5. 在飞书客户端搜索应用名，添加机器人为联系人。
+
+> `Typing` 表情与卡片按钮依赖机器人在会话内有消息交互权限（`im:message`）。
+> 若表情接口被拒，网关会自动退回发送 `hintText` 提示语。
 
 ## 安装（作为 DSH 插件）
 
@@ -59,7 +73,7 @@ web profile 是 DSH 的默认图形界面 profile（`dsh --profile web`）。
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "@kriskwok/dsh-feishu-gateway": "^0.1.0"
+    "@kriskwok/dsh-feishu-gateway": "^0.2.0"
   },
   "dsh": {
     "profile": {
@@ -113,7 +127,7 @@ cat > package.json <<'EOF'
   "name": "dsh-profile-feishu",
   "private": true,
   "dependencies": {
-    "@kriskwok/dsh-feishu-gateway": "^0.1.0"
+    "@kriskwok/dsh-feishu-gateway": "^0.2.0"
   },
   "dsh": {
     "profile": {
@@ -147,11 +161,26 @@ dsh --profile feishu
 | `feishu.botOpenId` | 空 | 可选；@ 识别可自动完成 |
 | `feishu.replyMode` | `at` | 群聊策略：`at` 仅被 @ 回复 / `all` 全部回复 |
 | `workspace` | `~/Documents/DSH-Workspace` | agent 工作目录 |
-| `hintText` | `爸爸，我正在努力处理中……` | "处理中"提示语 |
+| `hintText` | `爸爸，我正在努力处理中……` | 兜底"处理中"文案（仅当 Typing 表情被禁用/不可用时） |
+| `reporting.mode` | `stream` | `stream`=流式进度卡片；`final`=只显示最终结果 |
+| `reporting.typingReaction` | `true` | 处理中显示原生 Typing 表情 |
+| `reporting.showReasoning` | `true` | 卡片中流式显示模型思考 |
+| `reporting.showToolCalls` | `true` | 卡片中流式显示工具调用 |
+| `reporting.patchIntervalMs` | `700` | 卡片刷新最小间隔（毫秒，飞书有限流） |
+| `reporting.maxBodyChars` | `900` | 卡片正文最大渲染长度 |
+| `reporting.failureReaction` | `CrossMark` | 失败时（移除 Typing 后）追加的表情 |
+| `interactions.approvalCards` | `true` | 权限审批用可点击卡片回答 |
+| `interactions.userQuestionsCards` | `true` | `ask_user_question` 用可点击卡片回答 |
 | `newSessionPatterns` | `/new` 及中文短语 | 触发另起会话的正则列表 |
 | `sessionsFile` | `data/dsh-feishu-sessions.json` | 会话映射持久化文件 |
 | `http.port` | `0` | 管理 API 端口（`0`=禁用） |
 | `http.token` | 空 | 管理 API Bearer Token |
+
+> **web profile 下的问答卡片**：`ask_user_question` 的作答走唯一的
+> `ctx.userQuestions` provider 槽位。当 Web UI 与网关同进程（推荐部署）时该槽位
+> 归 Web UI，因此 `ask_user_question` 在 Web UI 中作答；而**权限审批卡片在任何
+> 部署下都从飞书作答**。独立 feishu profile 下，`ask_user_question` 与审批都在
+> 飞书卡片中作答。
 
 ## 管理 HTTP API（可选）
 

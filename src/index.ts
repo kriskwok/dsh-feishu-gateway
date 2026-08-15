@@ -24,6 +24,7 @@ import {
 import { FeishuClient } from './feishu.js'
 import { SessionMap } from './session-map.js'
 import { ChatHandler } from './chat.js'
+import { InteractionService } from './interactions.js'
 import { PushService } from './push.js'
 import { AdminServer } from './server.js'
 import { logger } from './logger.js'
@@ -58,12 +59,18 @@ export async function apply(ctx: Context, config: FeishuGatewayConfig = {}): Pro
     domain: runtime.feishu?.domain ?? 'feishu',
   })
   const sessionMap = new SessionMap(runtime.sessionsFile ?? 'data/dsh-feishu-sessions.json')
-  const chat = new ChatHandler({ ctx, config: runtime, feishu, sessions: sessionMap })
+  const interactions = new InteractionService({ ctx, config: runtime, feishu, sessions: sessionMap })
+  const chat = new ChatHandler({ ctx, config: runtime, feishu, sessions: sessionMap, interactions })
   const push = new PushService(feishu)
 
-  // Feishu long connection: receive messages.
+  // In-conversation Q&A: permission approvals + ask_user_question over cards.
+  interactions.registerApprovalAnswerer()
+  interactions.registerUserQuestionsProvider()
+
+  // Feishu long connection: receive messages + card button clicks.
   await feishu.startEventSubscription({
     'im.message.receive_v1': chat.handleMessage,
+    'card.action.trigger': interactions.handleCardAction,
   })
 
   // Optional admin HTTP API (health / push / sessions).
@@ -82,6 +89,7 @@ export async function apply(ctx: Context, config: FeishuGatewayConfig = {}): Pro
   )
 
   return async () => {
+    interactions.dispose()
     sessionMap.flush()
     feishu.close()
     await admin.stop().catch(() => undefined)

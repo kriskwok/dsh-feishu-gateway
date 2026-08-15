@@ -85,12 +85,23 @@ export class FeishuClient {
   /** Start the long-connection event subscription. */
   async startEventSubscription(handlers: {
     'im.message.receive_v1'?: (data: FeishuMessageEvent) => Promise<void> | void
+    /**
+     * Interactive card button clicks (`card.action.trigger`), delivered over the
+     * same long connection. `value` carries the opaque payload the card buttons
+     * were built with (e.g. the approval / question id).
+     */
+    'card.action.trigger'?: (data: CardActionEvent) => Promise<void> | void
     [eventName: string]: ((data: any) => Promise<void> | void) | undefined
   }): Promise<void> {
+    const dispatcherHandlers: Record<string, ((data: any) => Promise<void> | void) | undefined> = { ...handlers }
+    if (handlers['card.action.trigger'] !== undefined) {
+      dispatcherHandlers['card.action.trigger'] = (raw: Record<string, unknown>) =>
+        handlers['card.action.trigger']!(normalizeCardAction(raw))
+    }
     const dispatcher = new lark.EventDispatcher({
       verificationToken: this.opts.verificationToken || undefined,
       encryptKey: this.opts.encryptKey || undefined,
-    }).register(handlers)
+    }).register(dispatcherHandlers)
 
     this.wsClient = new lark.WSClient({
       appId: this.opts.appId,
@@ -126,6 +137,11 @@ export class FeishuClient {
     await this.reply(messageId, 'text', JSON.stringify({ text }))
   }
 
+  /** Reply with an interactive card; returns the created card message id. */
+  async replyCard(messageId: string, card: CardBody): Promise<string> {
+    return this.reply(messageId, 'interactive', JSON.stringify(card))
+  }
+
   /**
    * Reply with a Markdown-rich post message (md tag): Feishu renders bold /
    * inline code / lists / links without using cards. Long text is chunked
@@ -146,13 +162,14 @@ export class FeishuClient {
     }
   }
 
-  /** Reply with an arbitrary message type. */
-  async reply(messageId: string, msgType: MessageType, content: string): Promise<void> {
+  /** Reply with an arbitrary message type; returns the created message id. */
+  async reply(messageId: string, msgType: MessageType, content: string): Promise<string> {
     const res = await this.client.im.message.reply({
       path: { message_id: messageId },
       data: { msg_type: msgType, content },
     })
     this.assertOk(res, 'reply')
+    return res.data?.message_id ?? ''
   }
 
   /** Proactively push a message to a user/group. */
@@ -179,10 +196,83 @@ export class FeishuClient {
     this.assertOk(res, 'patchCard')
   }
 
+  /**
+   * Add an emoji reaction to a message (native "typing" indicator while the
+   * answer is being produced — hermes-style). Returns the reaction id needed
+   * to remove it later, or undefined on failure.
+   */
+  async addReaction(messageId: string, emojiType: string): Promise<string | undefined> {
+    try {
+      const res = await this.client.im.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      })
+      this.assertOk(res, 'addReaction')
+      return res.data?.reaction_id
+    } catch (err) {
+      logger.warn('feishu', `addReaction ${emojiType} on ${messageId} failed:`, err)
+      return undefined
+    }
+  }
+
+  /** Remove an emoji reaction added by this bot (best-effort). */
+  async removeReaction(messageId: string, reactionId: string): Promise<boolean> {
+    try {
+      const res = await this.client.im.messageReaction.delete({
+        path: { message_id: messageId, reaction_id: reactionId },
+      })
+      this.assertOk(res, 'removeReaction')
+      return true
+    } catch (err) {
+      logger.warn('feishu', `removeReaction ${reactionId} on ${messageId} failed:`, err)
+      return false
+    }
+  }
+
   private assertOk(res: LarkResponse, scope: string): void {
     if (res.code !== undefined && res.code !== 0) {
       throw new Error(`Feishu API error [${scope}]: code=${res.code}, msg=${res.msg}`)
     }
+  }
+}
+
+/** `card.action.trigger` payload over the long connection (raw shape). */
+export interface CardActionEvent {
+  /** Raw event payload; message/chat ids may nest under `context` (v2). */
+  raw?: Record<string, unknown>
+  /** The card message id (`context.open_message_id` / top-level `open_message_id`). */
+  messageId?: string
+  /** The chat the card lives in (`context.open_chat_id` / top-level `open_chat_id`). */
+  chatId?: string
+  /** The operator (clicker) identity. */
+  operator?: { openId?: string; userId?: string; name?: string }
+  /** The clicked element: `value` carries the payload the card buttons carried. */
+  action?: { value?: unknown; tag?: string; name?: string; option?: string }
+  /** Feishu's dedup token for this click. */
+  token?: string
+}
+
+/** Normalize a raw `card.action.trigger` payload into {@link CardActionEvent}. */
+export function normalizeCardAction(data: Record<string, unknown>): CardActionEvent {
+  const context = (typeof data.context === 'object' && data.context !== null ? data.context : {}) as Record<string, unknown>
+  const operator = (typeof data.operator === 'object' && data.operator !== null ? data.operator : {}) as Record<string, unknown>
+  const action = (typeof data.action === 'object' && data.action !== null ? data.action : {}) as Record<string, unknown>
+  return {
+    raw: data,
+    messageId: String(context.open_message_id ?? data.open_message_id ?? '') || undefined,
+    chatId: String(context.open_chat_id ?? data.open_chat_id ?? '') || undefined,
+    operator: {
+      openId: String(operator.open_id ?? '') || undefined,
+      userId: String(operator.user_id ?? '') || undefined,
+      name: String(operator.name ?? '') || undefined,
+    },
+    action: {
+      value: action.value,
+      tag: typeof action.tag === 'string' ? action.tag : undefined,
+      name: typeof action.name === 'string' ? action.name : undefined,
+      option: typeof action.option === 'string' ? action.option : undefined,
+    },
+    token: typeof data.token === 'string' ? data.token : undefined,
   }
 }
 

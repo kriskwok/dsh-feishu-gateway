@@ -1,13 +1,16 @@
 /**
  * dsh-feishu-gateway 自测（不依赖真实飞书 / DSH）：
  *   pnpm test
- * 覆盖：消息解析、Markdown 分片、会话映射、summarize、ChatHandler 端到端（mock agents）。
+ * 覆盖：消息解析、Markdown 分片、会话映射、summarize、ChatHandler 端到端（mock agents）、
+ *       Typing 表情、流式卡片汇报、审批/问答交互卡片。
  */
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { extractText, cleanText, summarize, ChatHandler } from '../src/chat.js'
 import { splitMarkdown } from '../src/feishu.js'
 import { SessionMap, conversationKey } from '../src/session-map.js'
+import { InteractionService } from '../src/interactions.js'
+import { resolveConfig } from '../src/config.js'
 import type { FeishuMessageEvent } from '../src/feishu.js'
 
 let passed = 0
@@ -49,8 +52,11 @@ function testSessionMap(): void {
   const id1 = sm.idFor(key)
   ok('生成 id', id1.startsWith('feishu-'))
   ok('同会话复用', sm.idFor(key) === id1)
+  sm.recordSession(key, id1, { key, chatId: 'oc_1', chatType: 'group', userOpenId: 'ou_1' })
+  ok('反向索引', sm.infoForSession(id1)?.chatId === 'oc_1')
   sm.reset(key)
   ok('重置后新 id', sm.idFor(key) !== id1)
+  ok('重置后反向索引清除', sm.infoForSession(id1) === undefined)
   const sm2 = new SessionMap(file)
   ok('持久化重载', sm2.idFor('k2') !== undefined)
 }
@@ -68,54 +74,80 @@ function testSummarize(): void {
   ok('reason 正确', out.reason?.kind === 'completed')
 }
 
+/** 生成一个会在 followup 时同步派发会话事件的 mock agent。 */
+function makeAgent(emit: (event: Record<string, unknown>) => void): any {
+  const events: Array<Record<string, unknown>> = []
+  const session = { id: 'feishu-session', seq: 1, events }
+  const agent = {
+    session,
+    whenIdle: async () => undefined,
+    followup: () => {
+      const evs = [
+        { type: 'turn/start', seq: 2, data: {} },
+        { type: 'assistant/message', seq: 3, data: { message: { content: [{ type: 'text', text: '这是 DSH 的最终答复。' }] } } },
+        { type: 'turn/end', seq: 4, data: { reason: { kind: 'completed' } } },
+      ]
+      for (const e of evs) {
+        events.push(e)
+        emit(e)
+      }
+    },
+  }
+  return agent
+}
+
 async function testChatHandler(): Promise<void> {
   console.log('\n[5] ChatHandler 端到端（mock agents）')
   const calls: Array<{ kind: string; args: unknown[] }> = []
   let resumeCount = 0
   let createCount = 0
   const resumeIds: string[] = []
-
-  // mock agent：followup 时生成完整事件流
-  function makeAgent(): any {
-    const events: Array<Record<string, unknown>> = []
-    const agent = {
-      session: { seq: 1, events },
-      whenIdle: async () => undefined,
-      followup: () => {
-        events.push(
-          { type: 'turn/start', seq: 2, data: {} },
-          { type: 'assistant/message', seq: 3, data: { message: { content: [{ type: 'text', text: '这是 DSH 的最终答复。' }] } } },
-          { type: 'turn/end', seq: 4, data: { reason: { kind: 'completed' } } },
-        )
-      },
-    }
-    return agent
-  }
+  const listeners: Array<(session: unknown, event: unknown) => void> = []
 
   const mockAgents = {
     resume: async (opts: { resumeSessionId: unknown }) => {
       resumeCount++
       resumeIds.push(String(opts.resumeSessionId))
-      return { agent: makeAgent(), dispose: async () => undefined }
+      return { agent: makeAgent((e) => { for (const l of listeners) l({ id: 'feishu-session' }, e) }), dispose: async () => undefined }
     },
     create: async () => {
       createCount++
-      return { agent: makeAgent(), dispose: async () => undefined }
+      return { agent: makeAgent((e) => { for (const l of listeners) l({ id: 'feishu-session' }, e) }), dispose: async () => undefined }
     },
   }
   const mockDefaultModel = { currentSelection: () => ({ provider: 'deepseek', model: 'mock-model' }) }
   const ctx = {
     get: (key: string) => (key === 'agents' ? mockAgents : key === 'agentDefaultModel' ? mockDefaultModel : undefined),
+    on: (_name: string, fn: (session: unknown, event: unknown) => void) => {
+      listeners.push(fn)
+      return () => {
+        const i = listeners.indexOf(fn)
+        if (i >= 0) listeners.splice(i, 1)
+      }
+    },
   } as never
 
   const feishuMock = {
     replyText: async (messageId: string, text: string) => calls.push({ kind: 'replyText', args: [messageId, text] }),
     replyMarkdown: async (messageId: string, text: string) => calls.push({ kind: 'replyMarkdown', args: [messageId, text] }),
+    replyCard: async (messageId: string, card: unknown) => {
+      calls.push({ kind: 'replyCard', args: [messageId, card] })
+      return 'card-reply-1'
+    },
+    patchCard: async (messageId: string, card: unknown) => calls.push({ kind: 'patchCard', args: [messageId, card] }),
+    addReaction: async (messageId: string, emoji: string) => {
+      calls.push({ kind: 'addReaction', args: [messageId, emoji] })
+      return `reaction-${emoji}`
+    },
+    removeReaction: async (messageId: string, reactionId: string) => {
+      calls.push({ kind: 'removeReaction', args: [messageId, reactionId] })
+      return true
+    },
   } as never
 
   const file = path.join(os.tmpdir(), `chat-${Date.now()}.json`)
   const sessions = new SessionMap(file)
-  const config = {
+  const baseConfig = {
     feishu: { appId: 'a', appSecret: 's', domain: 'feishu' as const, botOpenId: 'ou_bot', replyMode: 'at' as const },
     workspace: '/tmp',
     hintText: '爸爸，我正在努力处理中……',
@@ -123,7 +155,6 @@ async function testChatHandler(): Promise<void> {
     sessionsFile: file,
     http: { port: 0, token: '' },
   }
-  const handler = new ChatHandler({ ctx, config, feishu: feishuMock, sessions })
 
   const p2p: FeishuMessageEvent = {
     sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
@@ -132,23 +163,54 @@ async function testChatHandler(): Promise<void> {
       message_type: 'text', content: JSON.stringify({ text: '查一下热搜' }),
     },
   }
+
+  // --- 默认 stream 模式：Typing 表情 + 流式卡片 + 最终 Markdown ---
+  calls.length = 0
+  const handler = new ChatHandler({ ctx, config: resolveConfig(baseConfig), feishu: feishuMock, sessions })
   await handler.handleMessage(p2p)
-  ok('p2p：先回提示语', calls.some((c) => c.kind === 'replyText' && c.args[1] === '爸爸，我正在努力处理中……'))
-  ok('p2p：resume 会话', resumeCount === 1)
-  ok('p2p：Markdown 回复最终答复', calls.some((c) => c.kind === 'replyMarkdown' && c.args[1] === '这是 DSH 的最终答复。'))
+  ok('stream：先加 Typing 表情', calls.some((c) => c.kind === 'addReaction' && c.args[1] === 'Typing'))
+  ok('stream：发送流式卡片', calls.some((c) => c.kind === 'replyCard'))
+  ok('stream：resume 会话', resumeCount === 1)
+  ok('stream：最终 Markdown 答复', calls.some((c) => c.kind === 'replyMarkdown' && c.args[1] === '这是 DSH 的最终答复。'))
+  ok('stream：移除 Typing 表情', calls.some((c) => c.kind === 'removeReaction'))
+  ok('stream：卡片完成态 patch', calls.some((c) => c.kind === 'patchCard'))
+  ok('stream：不再发提示语', !calls.some((c) => c.kind === 'replyText' && String(c.args[1]).includes('正在努力处理')))
+
+  // --- final 模式：无卡片，只有 Typing + 最终答复 ---
+  calls.length = 0
+  const handlerFinal = new ChatHandler({
+    ctx,
+    config: resolveConfig({ ...baseConfig, reporting: { mode: 'final' } }),
+    feishu: feishuMock,
+    sessions: new SessionMap(file),
+  })
+  await handlerFinal.handleMessage(p2p)
+  ok('final：仍加 Typing 表情', calls.some((c) => c.kind === 'addReaction' && c.args[1] === 'Typing'))
+  ok('final：无流式卡片', !calls.some((c) => c.kind === 'replyCard'))
+  ok('final：最终 Markdown 答复', calls.some((c) => c.kind === 'replyMarkdown'))
+
+  // --- typingReaction=false：退回提示语 ---
+  calls.length = 0
+  const handlerHint = new ChatHandler({
+    ctx,
+    config: resolveConfig({ ...baseConfig, reporting: { typingReaction: false } }),
+    feishu: feishuMock,
+    sessions: new SessionMap(file),
+  })
+  await handlerHint.handleMessage(p2p)
+  ok('禁用表情：回提示语', calls.some((c) => c.kind === 'replyText' && String(c.args[1]).includes('正在努力处理')))
+  ok('禁用表情：不加 Typing', !calls.some((c) => c.kind === 'addReaction'))
 
   // 第二问（同一会话）→ 相同 session id
   const p2p2: FeishuMessageEvent = { ...p2p, message: { ...p2p.message, message_id: 'm2', content: JSON.stringify({ text: '继续' }) } }
   await handler.handleMessage(p2p2)
-  ok('多轮：复用同一 DSH session', resumeIds.length === 2 && resumeIds[0] === resumeIds[1])
+  ok('多轮：复用同一 DSH session', resumeIds.length >= 2 && resumeIds[resumeIds.length - 1] === resumeIds[0])
 
   // /new → 重置会话
   const newCmd: FeishuMessageEvent = { ...p2p, message: { ...p2p.message, message_id: 'm3', content: JSON.stringify({ text: '/new' }) } }
   calls.length = 0
   await handler.handleMessage(newCmd)
   ok('/new：回复重置提示', calls.some((c) => c.kind === 'replyText' && String(c.args[1]).includes('全新会话')))
-  const next = await handler['deps'] ?? null
-  void next
   const smCheck = new SessionMap(file)
   ok('/new：映射已清除', smCheck.idFor('ou_user') !== resumeIds[1] ? true : (smCheck.reset('ou_user'), true))
 
@@ -171,11 +233,20 @@ async function testChatHandler(): Promise<void> {
     },
     create: async () => {
       createCount++
-      return { agent: makeAgent(), dispose: async () => undefined }
+      return { agent: makeAgent((e) => { for (const l of listeners) l({ id: 'feishu-session' }, e) }), dispose: async () => undefined }
     },
   }
-  const ctxFail = { get: (key: string) => (key === 'agents' ? mockAgentsFail : key === 'agentDefaultModel' ? mockDefaultModel : undefined) } as never
-  const handlerFail = new ChatHandler({ ctx: ctxFail, config, feishu: feishuMock, sessions: new SessionMap(file) })
+  const ctxFail = {
+    get: (key: string) => (key === 'agents' ? mockAgentsFail : key === 'agentDefaultModel' ? mockDefaultModel : undefined),
+    on: (_name: string, fn: (session: unknown, event: unknown) => void) => {
+      listeners.push(fn)
+      return () => {
+        const i = listeners.indexOf(fn)
+        if (i >= 0) listeners.splice(i, 1)
+      }
+    },
+  } as never
+  const handlerFail = new ChatHandler({ ctx: ctxFail, config: baseConfig, feishu: feishuMock, sessions: new SessionMap(file) })
   const groupAt: FeishuMessageEvent = {
     sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
     message: {
@@ -190,12 +261,77 @@ async function testChatHandler(): Promise<void> {
   ok('resume 失败回退 create', createCount > 0)
 }
 
+async function testInteractions(): Promise<void> {
+  console.log('\n[6] 审批/问答交互卡片')
+  const calls: Array<{ kind: string; args: unknown[] }> = []
+  const approvalListeners: Array<(req: unknown, next: () => Promise<string>) => Promise<string> | string> = []
+
+  const file = path.join(os.tmpdir(), `interact-${Date.now()}.json`)
+  const sessions = new SessionMap(file)
+  const key = conversationKey('oc_p2p', 'p2p', 'ou_user')
+  const sessionId = sessions.idFor(key)
+  sessions.recordSession(key, sessionId, { key, chatId: 'oc_p2p', chatType: 'p2p', userOpenId: 'ou_user' })
+
+  const feishuMock = {
+    push: async (opts: { receiveId: string; msgType: string; content: string }) => {
+      calls.push({ kind: 'push', args: [opts] })
+      return `card-${calls.length}`
+    },
+    patchCard: async (messageId: string, card: unknown) => calls.push({ kind: 'patchCard', args: [messageId, card] }),
+  } as never
+
+  const ctx = {
+    get: (keyName: string) => (keyName === 'sessions' ? undefined : undefined),
+    on: (_name: string, fn: (req: unknown, next: () => Promise<string>) => Promise<string> | string, opts: unknown) => {
+      void opts
+      approvalListeners.push(fn)
+      return () => {
+        const i = approvalListeners.indexOf(fn)
+        if (i >= 0) approvalListeners.splice(i, 1)
+      }
+    },
+  } as never
+
+  const svc = new InteractionService({ ctx, config: {}, feishu: feishuMock, sessions })
+  svc.registerApprovalAnswerer()
+  ok('注册了 approval 监听', approvalListeners.length === 1)
+
+  // 审批：Feishu 会话 → 推卡片，点击后返回 allowed-once
+  const pending = approvalListeners[0]!(
+    { agent: { session: { id: sessionId } }, toolName: 'bash', reason: 'sandbox escalation' },
+    () => Promise.resolve('unavailable'),
+  )
+  await new Promise((r) => setTimeout(r, 10))
+  ok('审批：推送交互卡片', calls.some((c) => c.kind === 'push' && (c.args[0] as { msgType: string }).msgType === 'interactive'))
+  const pushed = calls.find((c) => c.kind === 'push')?.args[0] as { content: string }
+  const card = JSON.parse(pushed.content) as { elements: Array<{ actions?: Array<{ value?: unknown }> }> }
+  const approveValue = card.elements[1]?.actions?.[0]?.value as { id: string } | undefined
+  ok('审批：卡片带允许按钮', approveValue !== undefined && typeof approveValue.id === 'string')
+
+  // 模拟点击"允许"
+  await svc.handleCardAction({ messageId: 'card-1', chatId: 'oc_p2p', action: { value: { kind: 'approval', id: approveValue!.id } } } as never)
+  const outcome = await pending
+  ok('审批：点击后返回 allowed-once', outcome === 'allowed-once')
+  ok('审批：卡片更新为已处理', calls.some((c) => c.kind === 'patchCard'))
+
+  // 非 Feishu 会话 → 委托 next()
+  const delegated = await approvalListeners[0]!(
+    { agent: { session: { id: 'other-session' } }, toolName: 'bash' },
+    () => Promise.resolve('unavailable'),
+  )
+  ok('审批：非 Feishu 会话委托 next()', delegated === 'unavailable')
+  ok('审批：未推卡片', calls.filter((c) => c.kind === 'push').length === 1)
+
+  svc.dispose()
+}
+
 async function main(): Promise<void> {
   testParsing()
   testSplit()
   testSessionMap()
   testSummarize()
   await testChatHandler()
+  await testInteractions()
   console.log(`\n自测完成：${passed} 项通过${process.exitCode ? '（有失败）' : ''}`)
 }
 

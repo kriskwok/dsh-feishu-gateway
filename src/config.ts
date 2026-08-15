@@ -28,8 +28,49 @@ export interface FeishuGatewayConfig {
   }
   /** Agent working directory (cwd of the DSH session). */
   workspace?: string
-  /** The "processing" hint text shown in Feishu while the agent works. */
+  /**
+   * The "processing" hint text shown in Feishu while the agent works. Only used
+   * as a fallback when the native Typing reaction is disabled (`reporting.typingReaction: false`)
+   * or the reaction API fails.
+   * @deprecated replaced by the native Typing reaction indicator.
+   */
   hintText?: string
+  /**
+   * Long-task reporting.
+   *
+   * - `'stream'` (default): a live interactive card streams the agent's progress —
+   *   thinking, tool calls, answer draft — patched as the session events arrive,
+   *   ending with a summary card plus the final Markdown answer.
+   * - `'final'`: only the final answer is sent (plus the Typing reaction), no
+   *   streaming card.
+   */
+  reporting?: {
+    /** `'stream'` shows the full streaming thinking process; `'final'` only the result. */
+    mode?: 'stream' | 'final'
+    /** Show the native Feishu Typing reaction while the answer is being produced. */
+    typingReaction?: boolean
+    /** Show the model's reasoning (thinking) in the streaming card. */
+    showReasoning?: boolean
+    /** Show tool-call activity in the streaming card. */
+    showToolCalls?: boolean
+    /** Minimum interval between card patches (ms); Feishu rate-limits card updates. */
+    patchIntervalMs?: number
+    /** Max characters rendered in the streaming card body (card payload is size-limited). */
+    maxBodyChars?: number
+    /** Emoji reaction added on failure instead of Typing (hermes-style). */
+    failureReaction?: string
+  }
+  /**
+   * Interactive card answering for in-conversation Q&A: permission approvals
+   * (`approval/request`, e.g. sandbox escalation) and the model's
+   * `ask_user_question` tool are answered by clicking Feishu cards.
+   */
+  interactions?: {
+    /** Answer permission-approval requests with Feishu cards (click 允许/拒绝). */
+    approvalCards?: boolean
+    /** Answer the model's `ask_user_question` tool with Feishu cards (click options). */
+    userQuestionsCards?: boolean
+  }
   /** Regex list that resets the conversation (e.g. `/new`, "另起会话"). */
   newSessionPatterns?: string[]
   /** Persistence file for the Feishu-conversation → DSH-session mapping. */
@@ -52,6 +93,19 @@ export const Config: Schema<FeishuGatewayConfig> = z.object({
   }),
   workspace: z.string().default('~/Documents/DSH-Workspace'),
   hintText: z.string().default('爸爸，我正在努力处理中……'),
+  reporting: z.object({
+    mode: z.union([z.const('stream'), z.const('final')]).default('stream'),
+    typingReaction: z.boolean().default(true),
+    showReasoning: z.boolean().default(true),
+    showToolCalls: z.boolean().default(true),
+    patchIntervalMs: z.number().default(700),
+    maxBodyChars: z.number().default(900),
+    failureReaction: z.string().default('CrossMark'),
+  }),
+  interactions: z.object({
+    approvalCards: z.boolean().default(true),
+    userQuestionsCards: z.boolean().default(true),
+  }),
   newSessionPatterns: z
     .array(z.string())
     .default(['^/new$', '^(另起|新开|开启|新建)?\\s*(一个)?\\s*(新|全新)?\\s*会话', '^重新开始$', '^换个话题$']),

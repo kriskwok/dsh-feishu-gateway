@@ -1,0 +1,438 @@
+/**
+ * In-conversation Q&A over Feishu interactive cards (click to answer).
+ *
+ * Two DSH capability seams are bridged to Feishu cards:
+ *
+ * 1. **Permission approvals** — the `approval/request` waterfall (sandbox
+ *    escalation, out-of-workspace writes, …). The gateway claims requests that
+ *    belong to a Feishu-owned session, pushes an interactive card with
+ *    `✅ 允许一次` / `🚫 拒绝` buttons, and resolves the outcome when a button
+ *    is clicked (or `'cancelled'` when the ask's signal aborts). Requests for
+ *    sessions this gateway does not own are delegated via `next()` so the web
+ *    UI (or the fail-closed default) still answers them.
+ * 2. **The model's `ask_user_question` tool** — via `ctx.userQuestions`. The
+ *    gateway registers itself as the single user-questions provider when the
+ *    slot is free (standalone profile); when the DSH Web UI already owns the
+ *    provider, registration is skipped with an info log (the web UI answers
+ *    those questions instead). Questions with options render clickable option
+ *    buttons; option-less questions are answered by replying with text in the
+ *    chat.
+ *
+ * Card clicks arrive over the same Feishu long connection as
+ * `card.action.trigger` and are routed by the opaque `value` carried on the
+ * card buttons.
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
+import type {
+  AskUserQuestionAnswer,
+  AskUserQuestionItem,
+  AskUserQuestionRequest,
+} from '@deepseek-ai/dsh-user-questions'
+import type { CardActionEvent, CardBody, FeishuClient } from './feishu.js'
+import type { SessionMap } from './session-map.js'
+import type { FeishuGatewayConfig } from './config.js'
+import { logger } from './logger.js'
+
+/** Opaque card-button payloads (routed back from `card.action.trigger`). */
+interface ApprovalCardValue {
+  kind: 'approval'
+  /** The approval request id (audit pair id). */
+  id: string
+  /** `true` on the reject button. */
+  reject?: boolean
+}
+
+interface QuestionCardValue {
+  kind: 'question'
+  /** The pending-question registry id. */
+  id: string
+  /** Selected option label, when clicked from an option button. */
+  label?: string
+}
+
+type CardValue = ApprovalCardValue | QuestionCardValue
+
+interface PendingApproval {
+  id: string
+  sessionId: string
+  chatId: string
+  cardMessageId?: string
+  resolve: (outcome: ApprovalOutcome) => void
+  onAbort?: () => void
+  settled: boolean
+}
+
+interface PendingQuestion {
+  id: string
+  sessionId: string
+  chatId: string
+  userOpenId: string
+  cardMessageId?: string
+  questions: AskUserQuestionItem[]
+  resolve: (answer: AskUserQuestionAnswer) => void
+  onAbort?: () => void
+  settled: boolean
+}
+
+export interface InteractionServiceDeps {
+  ctx: Context
+  config: FeishuGatewayConfig
+  feishu: FeishuClient
+  sessions: SessionMap
+}
+
+const MAX_LINEAGE_HOPS = 5
+
+export class InteractionService {
+  private readonly approvals = new Map<string, PendingApproval>()
+  private readonly questions = new Map<string, PendingQuestion>()
+  private readonly disposers: Array<() => void> = []
+
+  constructor(private readonly deps: InteractionServiceDeps) {}
+
+  /** Route one `card.action.trigger` (button click) to its pending interaction. */
+  handleCardAction = async (data: CardActionEvent): Promise<void> => {
+    const value = data.action?.value
+    if (typeof value !== 'object' || value === null) return
+    const cardValue = value as CardValue
+    try {
+      if (cardValue.kind === 'approval') {
+        await this.settleApproval(data, cardValue)
+      } else if (cardValue.kind === 'question') {
+        await this.settleQuestion(data, cardValue)
+      }
+    } catch (err) {
+      logger.error('interactions', 'handle card action error:', err)
+    }
+  }
+
+  /**
+   * Consume a chat message as the free-text answer of a pending option-less
+   * question. Called before routing; returns true when the message was an answer.
+   */
+  consumeTextAnswer(data: { message: { chat_id: string }; sender?: { sender_id?: { open_id?: string } } }, text: string): boolean {
+    const chatId = data.message.chat_id
+    const userOpenId = data.sender?.sender_id?.open_id ?? ''
+    for (const pending of this.questions.values()) {
+      if (pending.settled || pending.chatId !== chatId) continue
+      if (pending.userOpenId && userOpenId && pending.userOpenId !== userOpenId) continue
+      // Free-text answering only applies to option-less questions; option
+      // questions must be answered by clicking the card buttons.
+      if (pending.questions.some((q) => (q.options?.length ?? 0) > 0)) continue
+      this.settleQuestionNow(pending, {
+        answers: pending.questions.map((q) => ({ id: q.id, selected: [], custom: text })),
+      })
+      logger.info('interactions', `question ${pending.id} answered by text (${chatId})`)
+      return true
+    }
+    return false
+  }
+
+  /** Register the `approval/request` answerer (claims Feishu-owned asks). */
+  registerApprovalAnswerer(): void {
+    const enabled = this.deps.config.interactions?.approvalCards ?? true
+    if (!enabled) return
+    const off = this.deps.ctx.on(
+      'approval/request',
+      (req, next) => this.answerApproval(req, next),
+      { prepend: true },
+    )
+    this.disposers.push(off)
+  }
+
+  /**
+   * Register as the `ctx.userQuestions` provider. Only one provider can be
+   * active; when the DSH Web UI already owns it this is skipped with an info
+   * log (standalone feishu profiles get Feishu card Q&A).
+   */
+  registerUserQuestionsProvider(): void {
+    const enabled = this.deps.config.interactions?.userQuestionsCards ?? true
+    if (!enabled) return
+    const service = this.deps.ctx.get('userQuestions')
+    if (service === undefined) {
+      logger.warn('interactions', 'ctx.userQuestions unavailable; Feishu card Q&A disabled')
+      return
+    }
+    try {
+      const dispose = service.registerProvider({
+        ask: (request: AskUserQuestionRequest) => this.askUser(request),
+      })
+      this.disposers.push(dispose)
+      logger.info('interactions', 'registered as ctx.userQuestions provider (Feishu card Q&A)')
+    } catch (err) {
+      logger.info(
+        'interactions',
+        `ctx.userQuestions provider already registered (Web UI owns it): ${err instanceof Error ? err.message : String(err)} — Feishu card Q&A skipped`,
+      )
+    }
+  }
+
+  dispose(): void {
+    for (const pending of this.approvals.values()) {
+      this.settleApprovalNow(pending, 'cancelled')
+    }
+    for (const pending of this.questions.values()) {
+      pending.settled = true
+      pending.onAbort?.()
+      // The consumer (tool executor) owns the rejection; settle as empty.
+      pending.resolve({ answers: [] })
+    }
+    for (const off of this.disposers.splice(0)) off()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Approvals
+  // ---------------------------------------------------------------------------
+
+  private answerApproval(
+    req: ApprovalRequest,
+    next: () => Promise<ApprovalOutcome>,
+  ): Promise<ApprovalOutcome> {
+    if (req.signal?.aborted === true) return Promise.resolve<ApprovalOutcome>('cancelled')
+    const conv = this.resolveConversation(req.agent.session.id)
+    if (conv === undefined) return next()
+    const id = `appr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    return new Promise<ApprovalOutcome>((resolve) => {
+      const pending: PendingApproval = {
+        id,
+        sessionId: req.agent.session.id,
+        chatId: conv.chatId,
+        resolve,
+        settled: false,
+      }
+      const onAbort = (): void => this.settleApprovalNow(pending, 'cancelled')
+      pending.onAbort = onAbort
+      req.signal?.addEventListener('abort', onAbort, { once: true })
+      this.approvals.set(id, pending)
+      void this.pushApprovalCard(pending, req).catch((err) => {
+        logger.error('interactions', 'push approval card failed:', err)
+        this.approvals.delete(id)
+        req.signal?.removeEventListener('abort', onAbort)
+        resolve('unavailable')
+      })
+    })
+  }
+
+  private async pushApprovalCard(pending: PendingApproval, req: ApprovalRequest): Promise<void> {
+    const tool = req.toolName || '未知工具'
+    const reason = req.reason?.trim()
+    const lines = [`**工具**：\`${escapeMd(tool)}\``]
+    if (reason) lines.push(`**原因**：${escapeMd(reason)}`)
+    const card: CardBody = {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '🔐 需要你的授权' }, template: 'orange' },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } },
+        {
+          tag: 'action',
+          actions: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '✅ 允许一次' },
+              type: 'primary',
+              value: { kind: 'approval', id: pending.id } satisfies ApprovalCardValue,
+            },
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '🚫 拒绝' },
+              type: 'danger',
+              value: { kind: 'approval', id: pending.id, reject: true } satisfies ApprovalCardValue,
+            },
+          ],
+        },
+      ],
+    }
+    const messageId = await this.deps.feishu.push({
+      receiveId: pending.chatId,
+      receiveIdType: 'chat_id',
+      msgType: 'interactive',
+      content: JSON.stringify(card),
+    })
+    pending.cardMessageId = messageId
+    logger.info('interactions', `approval ${pending.id} card pushed → ${pending.chatId}`)
+  }
+
+  private async settleApproval(data: CardActionEvent, value: ApprovalCardValue): Promise<void> {
+    const pending = this.approvals.get(value.id)
+    if (pending === undefined || pending.settled) return
+    if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return
+    this.settleApprovalNow(pending, value.reject === true ? 'rejected' : 'allowed-once')
+  }
+
+  private settleApprovalNow(pending: PendingApproval, outcome: ApprovalOutcome): void {
+    if (pending.settled) return
+    pending.settled = true
+    pending.onAbort?.()
+    this.approvals.delete(pending.id)
+    pending.resolve(outcome)
+    if (pending.cardMessageId) {
+      const label =
+        outcome === 'allowed-once'
+          ? '✅ 已允许（一次性）'
+          : outcome === 'rejected'
+            ? '🚫 已拒绝'
+            : '⏹️ 已取消'
+      this.patchDecidedCard(pending.cardMessageId, '🔐 授权', label, outcome === 'allowed-once' ? 'green' : 'red').catch(() => undefined)
+    }
+    logger.info('interactions', `approval ${pending.id} → ${outcome}`)
+  }
+
+  // ---------------------------------------------------------------------------
+  // User questions (ask_user_question tool)
+  // ---------------------------------------------------------------------------
+
+  private askUser(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> {
+    const sessionId = request.agent?.id
+    if (sessionId === undefined) {
+      return Promise.reject(new Error('Feishu user interaction requires an agent-owned session'))
+    }
+    const conv = this.resolveConversation(sessionId)
+    if (conv === undefined) {
+      return Promise.reject(new Error('no Feishu conversation for session; cannot answer ask_user_question'))
+    }
+    const id = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
+      const pending: PendingQuestion = {
+        id,
+        sessionId,
+        chatId: conv.chatId,
+        userOpenId: conv.userOpenId,
+        questions: request.questions,
+        resolve,
+        settled: false,
+      }
+      const onAbort = (): void => {
+        if (pending.settled) return
+        pending.settled = true
+        this.questions.delete(id)
+        reject(new Error('ask_user_question was aborted before the user answered'))
+      }
+      pending.onAbort = onAbort
+      request.signal?.addEventListener('abort', onAbort, { once: true })
+      this.questions.set(id, pending)
+      void this.pushQuestionCard(pending).catch((err) => {
+        logger.error('interactions', 'push question card failed:', err)
+        if (pending.settled) return
+        pending.settled = true
+        this.questions.delete(id)
+        request.signal?.removeEventListener('abort', onAbort)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      })
+    })
+  }
+
+  private async pushQuestionCard(pending: PendingQuestion): Promise<void> {
+    const [first] = pending.questions
+    const options = first?.options ?? []
+    const lines: string[] = []
+    if (first?.header) lines.push(`**${escapeMd(first.header)}**`)
+    lines.push(escapeMd(first?.question ?? '请回答：'))
+    if (first?.detail) lines.push(`> ${escapeMd(first.detail)}`)
+    const elements: NonNullable<CardBody['elements']> = [
+      { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n\n') } },
+    ]
+    if (options.length > 0) {
+      elements.push({
+        tag: 'action',
+        actions: options.map((option, index) => ({
+          tag: 'button',
+          text: { tag: 'plain_text', content: truncate(option.label, 24) },
+          type: index === 0 ? 'primary' : 'default',
+          value: { kind: 'question', id: pending.id, label: option.label } satisfies QuestionCardValue,
+        })),
+      })
+      if (first?.multiSelect === true) {
+        elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '多选问题：点击任意选项即提交该选项。' }] })
+      }
+    } else {
+      elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '请在对话中直接回复消息作答。' }] })
+    }
+    const card: CardBody = {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: '❓ 需要你的回答' }, template: 'blue' },
+      elements,
+    }
+    const messageId = await this.deps.feishu.push({
+      receiveId: pending.chatId,
+      receiveIdType: 'chat_id',
+      msgType: 'interactive',
+      content: JSON.stringify(card),
+    })
+    pending.cardMessageId = messageId
+    logger.info('interactions', `question ${pending.id} card pushed → ${pending.chatId}`)
+  }
+
+  private async settleQuestion(data: CardActionEvent, value: QuestionCardValue): Promise<void> {
+    const pending = this.questions.get(value.id)
+    if (pending === undefined || pending.settled) return
+    if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return
+    const selected = value.label !== undefined ? [value.label] : []
+    this.settleQuestionNow(pending, {
+      answers: pending.questions.map((q) => ({ id: q.id, selected })),
+    })
+    logger.info('interactions', `question ${pending.id} answered by card click: ${selected.join(', ') || '(none)'}`)
+  }
+
+  private settleQuestionNow(pending: PendingQuestion, answer: AskUserQuestionAnswer): void {
+    if (pending.settled) return
+    pending.settled = true
+    pending.onAbort?.()
+    this.questions.delete(pending.id)
+    pending.resolve(answer)
+    if (pending.cardMessageId) {
+      const selected = answer.answers[0]?.selected ?? []
+      const label = selected.length > 0 ? selected.join('、') : (answer.answers[0]?.custom ?? '已作答')
+      this.patchDecidedCard(pending.cardMessageId, '❓ 问答', `你的选择：**${truncate(escapeMd(label), 60)}**`, 'green').catch(() => undefined)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shared helpers
+  // ---------------------------------------------------------------------------
+
+  /** Resolve the Feishu conversation for a session (bounded lineage walk). */
+  private resolveConversation(sessionId: string) {
+    const direct = this.deps.sessions.infoForSession(sessionId)
+    if (direct !== undefined) return direct
+    // Walk parent lineage (subagent sessions ask on behalf of the Feishu root).
+    const store = this.deps.ctx.get('sessions') as
+      | { get(id: unknown): { header: { parentSession?: unknown } } | undefined }
+      | undefined
+    let cursor: string | undefined = sessionId
+    for (let hop = 0; hop < MAX_LINEAGE_HOPS && cursor !== undefined; hop += 1) {
+      const current: { header: { parentSession?: unknown } } | undefined = store?.get(cursor)
+      if (current === undefined) break
+      const parentValue: unknown = current.header.parentSession
+      if (parentValue === undefined) break
+      const parentId: string = String(parentValue)
+      const conv = this.deps.sessions.infoForSession(parentId)
+      if (conv !== undefined) return conv
+      cursor = parentId
+    }
+    return undefined
+  }
+
+  /** Patch a card into its decided state (disable buttons, show the result). */
+  private async patchDecidedCard(messageId: string, title: string, body: string, template: 'green' | 'red'): Promise<void> {
+    const card: CardBody = {
+      config: { wide_screen_mode: true },
+      header: { title: { tag: 'plain_text', content: title }, template },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: body } },
+        { tag: 'note', elements: [{ tag: 'plain_text', content: '该卡片已处理，无需再次操作。' }] },
+      ],
+    }
+    await this.deps.feishu.patchCard(messageId, card)
+  }
+}
+
+/** Escape `lark_md`-sensitive characters in user/agent-supplied text. */
+function escapeMd(text: string): string {
+  return text.replace(/([\\`*_~\[\]])/g, '\\$1')
+}
+
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
+}

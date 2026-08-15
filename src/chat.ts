@@ -4,9 +4,11 @@ import type { ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { FeishuClient, FeishuMessageEvent } from './feishu.js'
 import { SessionMap, conversationKey } from './session-map.js'
+import type { InteractionService } from './interactions.js'
+import { TurnReporter } from './streaming.js'
 import type { FeishuGatewayConfig } from './config.js'
 import { logger } from './logger.js'
 
@@ -92,15 +94,19 @@ export interface ChatHandlerDeps {
   config: FeishuGatewayConfig
   feishu: FeishuClient
   sessions: SessionMap
+  interactions?: InteractionService
 }
 
 /**
  * Chat handler: Feishu messages → DSH agent (resume/create on a stable
- * session id) → reply with Markdown post.
+ * session id) → reply with Markdown post. Shows a native Typing reaction while
+ * working and, in `stream` mode, streams the agent's progress into a live card.
  */
 export class ChatHandler {
   private readonly recent = new RecentMessageSet()
   private readonly chains = new Map<string, Promise<unknown>>()
+  /** messageId → reactionId of the in-flight Typing reaction. */
+  private readonly typingReactions = new Map<string, string>()
 
   constructor(private readonly deps: ChatHandlerDeps) {}
 
@@ -126,6 +132,9 @@ export class ChatHandler {
 
     const text = cleanText(extractText(message.message_type, message.content))
     if (!text) return
+
+    // A pending option-less question consumes the next chat message as its answer.
+    if (this.deps.interactions?.consumeTextAnswer(data, text)) return
 
     const key = conversationKey(message.chat_id, chatType, userId)
     logger.info('chat', `[${chatType}] ${userId}: ${text.slice(0, 120)}`)
@@ -176,31 +185,62 @@ export class ChatHandler {
 
   private async respond(data: FeishuMessageEvent, key: string, text: string): Promise<void> {
     const { feishu, sessions, config } = this.deps
+    const messageId = data.message.message_id
+    const reporting = config.reporting ?? {}
+    const reporter: TurnReporter | undefined = reporting.mode === 'stream'
+      ? new TurnReporter({ feishu, config }, { replyToMessageId: messageId })
+      : undefined
     try {
-      await feishu.replyText(data.message.message_id, config.hintText ?? '爸爸，我正在努力处理中……')
+      // Native Typing reaction while the answer is being produced (falls back
+      // to the hint text when reactions are disabled or the API fails).
+      await this.beginTyping(messageId)
 
       const sessionId = sessions.idFor(key)
+      sessions.recordSession(key, sessionId, {
+        key,
+        chatId: data.message.chat_id,
+        chatType: data.message.chat_type === 'group' ? 'group' : 'p2p',
+        userOpenId: data.sender?.sender_id?.open_id ?? '',
+        lastUserMessageId: messageId,
+      })
       const cwd = this.expandWorkspace(config.workspace ?? '~/Documents/DSH-Workspace')
-      const outcome = await this.runTurn(sessionId, text, cwd)
 
-      if (outcome.reason?.kind === 'error') {
-        await feishu.replyText(
-          data.message.message_id,
-          `😵 DSH 处理失败：${outcome.reason.error.code}: ${outcome.reason.error.message}`,
-        )
+      if (reporter) await reporter.begin()
+
+      const outcome = await this.runTurn(sessionId, text, cwd, reporter)
+
+      const failed = outcome.reason?.kind === 'error'
+      await this.finishTyping(messageId, failed)
+      if (reporter) {
+        await reporter
+          .finish({ text: outcome.text, error: failed })
+          .catch((err) => logger.warn('chat', 'reporter finish error:', err))
+      }
+
+      if (failed) {
+        const reason = outcome.reason
+        const detail = reason !== undefined && reason.kind === 'error'
+          ? `${reason.error.code}: ${reason.error.message}`
+          : String(reason)
+        await feishu.replyText(messageId, `😵 DSH 处理失败：${detail}`)
         return
       }
       const answer = outcome.text.trim()
       if (!answer) {
-        await feishu.replyText(data.message.message_id, '😶 DSH 没有返回内容，请再试一次。')
+        await feishu.replyText(messageId, '😶 DSH 没有返回内容，请再试一次。')
         return
       }
-      await feishu.replyMarkdown(data.message.message_id, answer)
+      await feishu.replyMarkdown(messageId, answer)
     } catch (err) {
       logger.error('chat', 'turn failed:', err)
+      await this.finishTyping(messageId, true).catch(() => undefined)
+      if (reporter) {
+        await reporter.finish({ text: '', error: true }).catch(() => undefined)
+        reporter.dispose()
+      }
       await feishu
         .replyText(
-          data.message.message_id,
+          messageId,
           `😵 DSH 处理失败：${err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300)}`,
         )
         .catch(() => undefined)
@@ -208,7 +248,12 @@ export class ChatHandler {
   }
 
   /** Run one turn on a stable DSH session (resume, or create as fallback). */
-  private async runTurn(sessionId: string, text: string, cwd: string): Promise<TurnOutcome> {
+  private async runTurn(
+    sessionId: string,
+    text: string,
+    cwd: string,
+    reporter?: TurnReporter,
+  ): Promise<TurnOutcome> {
     const ctx = this.deps.ctx
     const agents = ctx.get('agents')
     const defaultModel = ctx.get('agentDefaultModel')
@@ -221,7 +266,7 @@ export class ChatHandler {
       installModelSelection(agentCtx, selected)
     }
 
-    let handle: { agent: any; dispose(): Promise<void> }
+    let handle: { agent: { session: Session; whenIdle(): Promise<void>; followup(msg: unknown): void }; dispose(): Promise<void> }
     try {
       handle = await agents.resume({ resumeSessionId: SessionId(sessionId), agentOptions, setup })
     } catch (err) {
@@ -235,9 +280,18 @@ export class ChatHandler {
     }
 
     const { agent } = handle
+    let disposeListener: (() => void) | undefined
     try {
       await agent.whenIdle()
       const firstSeq = agent.session.seq
+      if (reporter) {
+        // Stream every committed event of this turn into the live card.
+        disposeListener = ctx.on('session/event', (session: Session, event: SessionEvent) => {
+          if (session.id !== agent.session.id) return
+          if (event.seq < firstSeq) return
+          reporter.onEvent(event)
+        })
+      }
       agent.followup(
         createUserMessage({
           content: [{ type: 'text', text }],
@@ -247,8 +301,40 @@ export class ChatHandler {
       await agent.whenIdle()
       return summarize(agent.session.events, firstSeq)
     } finally {
+      disposeListener?.()
       // Release the live handle; the persisted session stays for the next resume.
       await handle.dispose().catch((err) => logger.warn('chat', 'dispose agent error:', err))
+    }
+  }
+
+  /** Add the Typing reaction (or send the hint text as fallback). */
+  private async beginTyping(messageId: string): Promise<void> {
+    const reporting = this.deps.config.reporting ?? {}
+    const useReaction = reporting.typingReaction ?? true
+    if (useReaction) {
+      const reactionId = await this.deps.feishu.addReaction(messageId, 'Typing')
+      if (reactionId !== undefined) {
+        this.typingReactions.set(messageId, reactionId)
+        return
+      }
+      logger.warn('chat', 'Typing reaction unavailable, falling back to hint text')
+    }
+    await this.deps.feishu
+      .replyText(messageId, this.deps.config.hintText ?? '爸爸，我正在努力处理中……')
+      .catch(() => undefined)
+  }
+
+  /** Remove the Typing reaction; on failure add the failure reaction instead. */
+  private async finishTyping(messageId: string, failed: boolean): Promise<void> {
+    const reactionId = this.typingReactions.get(messageId)
+    if (reactionId !== undefined) {
+      this.typingReactions.delete(messageId)
+      const removed = await this.deps.feishu.removeReaction(messageId, reactionId)
+      if (!removed) return
+    }
+    if (failed) {
+      const failureReaction = this.deps.config.reporting?.failureReaction ?? 'CrossMark'
+      await this.deps.feishu.addReaction(messageId, failureReaction).catch(() => undefined)
     }
   }
 
