@@ -2,9 +2,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
+// Type-only: the `ctx.agentPresets` service (preset roster) is provided by the
+// host in preset-roster deployments (e.g. the web profile); absent elsewhere.
+// No runtime import — the service is reached through `ctx.get('agentPresets')`.
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import { randomUUID } from 'node:crypto'
 import type { FeishuClient, FeishuMessageEvent } from './feishu.js'
 import { SessionMap, conversationKey } from './session-map.js'
 import type { InteractionService } from './interactions.js'
@@ -87,6 +92,34 @@ export function cleanText(text: string): string {
     .replace(/<at[^>]*\/>/g, '')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Whether an agent/session acquisition error means the identity is taken or
+ * wedged (live in the registry/store, or a crashed process left it in a
+ * permanent conflict): resume's "while it is live", create's "already exists"
+ * / "already registered".
+ */
+function isSessionConflict(err: unknown): boolean {
+  return /already exists|already registered|while it is live|is live/i.test(errorMessage(err))
+}
+
+/**
+ * The preset a session actually runs, newest selection winning (mirrors
+ * `resolveSessionPreset` from dsh-agent-presets without a runtime dependency):
+ * the creation header's `agentPreset`, overridden by any logged
+ * `agent-preset/selected` event (a blank-session switch).
+ */
+function sessionPresetOf(header: { agentPreset?: string }, events: readonly SessionEvent[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.type === 'agent-preset/selected') return event.data.agentPreset
+  }
+  return header.agentPreset
 }
 
 export interface ChatHandlerDeps {
@@ -247,39 +280,33 @@ export class ChatHandler {
     }
   }
 
-  /** Run one turn on a stable DSH session (resume, or create as fallback). */
+  /**
+   * Run one turn on a stable DSH session.
+   *
+   * Acquisition ladder (mirrors the dsh-lark-channel lookup):
+   * 1. `agents.get(id)` — a LIVE agent (e.g. opened by the Web UI, whose
+   *    session ownership is exclusive) is taken over directly and driven
+   *    without a dispose handle (Bug B).
+   * 2. `agents.resume(id)` — cold resume on the persisted session.
+   * 3. `agents.create(id)` — first-run fallback.
+   * 4. On a create/session conflict (a wedged identity from a crashed
+   *    process, or a still-live store entry), mint a FRESH session id, re-point
+   *    the Feishu conversation at it, and create there (Bug C).
+   *
+   * In preset-roster deployments (e.g. the web profile) the agent is composed
+   * from the deployment's agent preset — `meta.agentPreset` on create, and the
+   * session-recorded preset mounted on resume — so the model gets its tools
+   * instead of treating tool calls as plain text (Bug A).
+   */
   private async runTurn(
     sessionId: string,
     text: string,
     cwd: string,
     reporter?: TurnReporter,
   ): Promise<TurnOutcome> {
+    const acquired = await this.acquireAgent(sessionId, cwd)
+    const { agent, dispose } = acquired
     const ctx = this.deps.ctx
-    const agents = ctx.get('agents')
-    const defaultModel = ctx.get('agentDefaultModel')
-    if (!agents || !defaultModel) throw new Error('agents / agentDefaultModel services unavailable')
-
-    const selection = defaultModel.currentSelection()
-    const agentOptions = { provider: selection.provider, model: selection.model }
-    const setup = (agentCtx: Context): void => {
-      const selected: ModelSelectionRef = { current: selection, assembled: undefined }
-      installModelSelection(agentCtx, selected)
-    }
-
-    let handle: { agent: { session: Session; whenIdle(): Promise<void>; followup(msg: unknown): void }; dispose(): Promise<void> }
-    try {
-      handle = await agents.resume({ resumeSessionId: SessionId(sessionId), agentOptions, setup })
-    } catch (err) {
-      logger.warn('chat', `resume ${sessionId} failed (${err instanceof Error ? err.message : String(err)}), creating fresh`)
-      handle = await agents.create({
-        sessionId: SessionId(sessionId),
-        meta: { cwd },
-        agentOptions,
-        setup,
-      })
-    }
-
-    const { agent } = handle
     let disposeListener: (() => void) | undefined
     try {
       await agent.whenIdle()
@@ -302,8 +329,121 @@ export class ChatHandler {
       return summarize(agent.session.events, firstSeq)
     } finally {
       disposeListener?.()
-      // Release the live handle; the persisted session stays for the next resume.
-      await handle.dispose().catch((err) => logger.warn('chat', 'dispose agent error:', err))
+      // Release the handle we OWN; a taken-over shared agent (Web UI) is left
+      // for its actual owner to dispose.
+      if (dispose !== undefined) {
+        await dispose().catch((err) => logger.warn('chat', 'dispose agent error:', err))
+      }
+    }
+  }
+
+  /** Acquire an agent for the Feishu conversation (see the ladder above). */
+  private async acquireAgent(sessionId: string, cwd: string): Promise<{
+    agent: { session: Session; whenIdle(): Promise<void>; followup(msg: unknown): void }
+    dispose?: () => Promise<void>
+  }> {
+    const ctx = this.deps.ctx
+    const agents = ctx.get('agents')
+    const defaultModel = ctx.get('agentDefaultModel')
+    if (!agents || !defaultModel) throw new Error('agents / agentDefaultModel services unavailable')
+
+    // Bug B: a live agent (Web UI open, or a concurrent Feishu turn still
+    // holding the session) is taken over directly — resume would fail
+    // "while it is live" and create would fail "already exists".
+    const live = agents.get(SessionId(sessionId))
+    if (live !== undefined) {
+      logger.info('chat', `session ${sessionId} is live; taking over the running agent`)
+      return { agent: live }
+    }
+
+    const selection = defaultModel.currentSelection()
+    const agentOptions = { provider: selection.provider, model: selection.model }
+    const { agentPreset, setup } = await this.buildAgentSetup(selection)
+
+    try {
+      const handle = await agents.resume({ resumeSessionId: SessionId(sessionId), agentOptions, setup })
+      return { agent: handle.agent, dispose: handle.dispose }
+    } catch (err) {
+      const becameLive = agents.get(SessionId(sessionId))
+      if (becameLive !== undefined) return { agent: becameLive }
+      logger.warn('chat', `resume ${sessionId} failed (${errorMessage(err)}), creating fresh`)
+    }
+
+    try {
+      const handle = await agents.create({
+        sessionId: SessionId(sessionId),
+        meta: { cwd, ...agentPreset === undefined ? {} : { agentPreset } },
+        agentOptions,
+        setup,
+      })
+      return { agent: handle.agent, dispose: handle.dispose }
+    } catch (err) {
+      const becameLive = agents.get(SessionId(sessionId))
+      if (becameLive !== undefined) return { agent: becameLive }
+      if (!isSessionConflict(err)) throw err
+      // Bug C: a wedged/live identity (e.g. a crashed process left the session
+      // permanently "already exists"). Mint a fresh session id and re-point the
+      // Feishu conversation at it, so the chat heals itself instead of dying.
+      const freshId = `feishu-${randomUUID()}`
+      this.deps.sessions.remap(sessionId, freshId)
+      logger.warn('chat', `session ${sessionId} wedged (${errorMessage(err)}); continuing on fresh session ${freshId}`)
+      const handle = await agents.create({
+        sessionId: SessionId(freshId),
+        meta: { cwd, ...agentPreset === undefined ? {} : { agentPreset } },
+        agentOptions,
+        setup,
+      })
+      return { agent: handle.agent, dispose: handle.dispose }
+    }
+  }
+
+  /**
+   * Build the agent setup for preset-roster deployments: model selection plus
+   * the deployment preset (web profile composes agents from `standard`).
+   * Rosterless deployments (standalone feishu profile) skip preset mounting.
+   */
+  private async buildAgentSetup(selection: { provider: string; model: string }): Promise<{
+    agentPreset?: string
+    setup: (agentCtx: Context) => Promise<void> | void
+  }> {
+    const ctx = this.deps.ctx
+    const presets = ctx.get('agentPresets')
+    const selected: ModelSelectionRef = { current: selection, assembled: undefined }
+    if (presets === undefined) {
+      return {
+        setup: (agentCtx: Context): void => {
+          installModelSelection(agentCtx, selected)
+        },
+      }
+    }
+    // Resolve the default preset BEFORE creation so the session header records
+    // it (`meta.agentPreset`); a broken/empty roster degrades to the current
+    // rosterless behavior instead of failing every turn.
+    let agentPreset: string | undefined
+    let defaultResolved = false
+    try {
+      agentPreset = (await presets.resolve(undefined)).id
+      defaultResolved = true
+    } catch (err) {
+      logger.warn('chat', `default agent preset unavailable: ${errorMessage(err)}; composing without one`)
+    }
+    return {
+      ...agentPreset === undefined ? {} : { agentPreset },
+      setup: async (agentCtx: Context): Promise<void> => {
+        installModelSelection(agentCtx, selected)
+        if (presets === undefined) return
+        const agent = agentCtx.agent
+        if (agent === undefined) return
+        // Resume recomposes the preset the session RECORDED (header or a
+        // blank-session switch event), so a restarted session keeps the tools
+        // its history was produced under. A fresh create reads the preset back
+        // from `meta.agentPreset`; a legacy preset-less session in a healthy
+        // roster mounts the deployment default (platform behavior). Only a
+        // broken roster with no recorded preset skips mounting (degrade).
+        const recorded = sessionPresetOf(agent.session.header, agent.session.events)
+        if (!defaultResolved && recorded === undefined) return
+        await presets.mount(agentCtx, recorded)
+      },
     }
   }
 

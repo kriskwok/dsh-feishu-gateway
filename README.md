@@ -200,6 +200,20 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 > from Feishu in every setup. In a standalone feishu profile, both
 > `ask_user_question` and approvals are answered from Feishu cards.
 
+## Session coexistence & self-healing
+
+- **Preset composition (tools!)** — in preset-roster deployments (e.g. the web
+  profile), Feishu agents are composed from the deployment's agent preset
+  (`meta.agentPreset` + preset `mount`), so the model gets its tools instead of
+  treating tool calls as plain text.
+- **Web UI coexistence** — sessions have a single live owner. When the Web UI
+  opens a session, the Feishu side takes over the *running* agent via
+  `agents.get()` and drives the same session instead of failing with
+  "while it is live" / "already exists"; both surfaces share one conversation.
+- **Wedged-session self-heal** — if a crashed process leaves a session
+  permanently conflicted ("already exists"), the gateway mints a fresh session
+  id, re-points the Feishu conversation at it, and continues chatting.
+
 ## Admin HTTP API (optional)
 
 Enable by setting `http.port`. Endpoints:

@@ -67,6 +67,32 @@ export class SessionMap {
     logger.info('session-map', `conversation ${key} reset`)
   }
 
+  /**
+   * Re-point every conversation key at a new DSH session id (wedged-session
+   * self-heal): when a session identity is permanently conflicted, the
+   * conversation continues on a fresh id while the Feishu↔session mapping
+   * stays stable.
+   */
+  remap(oldSessionId: string, newSessionId: string): void {
+    let changed = false
+    for (const [key, id] of this.map) {
+      if (id === oldSessionId) {
+        this.map.set(key, newSessionId)
+        changed = true
+      }
+    }
+    const info = this.conv.get(oldSessionId)
+    if (info !== undefined) {
+      this.conv.delete(oldSessionId)
+      this.conv.set(newSessionId, info)
+      changed = true
+    }
+    if (changed) {
+      this.persist()
+      logger.warn('session-map', `remapped ${oldSessionId} → ${newSessionId}`)
+    }
+  }
+
   list(): Array<{ key: string; sessionId: string }> {
     return [...this.map.entries()].map(([k, v]) => ({ key: k, sessionId: v }))
   }

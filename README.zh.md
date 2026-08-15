@@ -182,6 +182,17 @@ dsh --profile feishu
 > 部署下都从飞书作答**。独立 feishu profile 下，`ask_user_question` 与审批都在
 > 飞书卡片中作答。
 
+## 会话共存与自愈
+
+- **预设编排（有工具！）** — 在 preset-roster 部署（如 web profile）下，飞书
+  agent 会从部署的 agent preset 编排（`meta.agentPreset` + preset `mount`），
+  模型因此拿到工具，而不会把工具调用当成纯文本。
+- **与 Web UI 共存** — 会话单 owner。当 Web UI 打开某会话后，飞书侧通过
+  `agents.get()` 接管正在运行的 agent 并驱动同一会话，不再报
+  "while it is live" / "already exists"；两个界面共享同一段对话。
+- **wedged 会话自愈** — 进程中途死亡留下永久冲突的会话（"already exists"）时，
+  网关自动换一个新 session id，并把飞书会话映射重指向它，继续对话。
+
 ## 管理 HTTP API（可选）
 
 设置 `http.port` 启用。端点：

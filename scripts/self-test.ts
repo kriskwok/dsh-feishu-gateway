@@ -105,6 +105,7 @@ async function testChatHandler(): Promise<void> {
   const listeners: Array<(session: unknown, event: unknown) => void> = []
 
   const mockAgents = {
+    get: () => undefined,
     resume: async (opts: { resumeSessionId: unknown }) => {
       resumeCount++
       resumeIds.push(String(opts.resumeSessionId))
@@ -228,6 +229,7 @@ async function testChatHandler(): Promise<void> {
 
   // 群聊@（mentioned_type=app）→ 处理；resume 失败 → create fallback
   const mockAgentsFail = {
+    get: () => undefined,
     resume: async () => {
       throw new Error('not found')
     },
@@ -325,6 +327,155 @@ async function testInteractions(): Promise<void> {
   svc.dispose()
 }
 
+async function testAcquisition(): Promise<void> {
+  console.log('\n[7] agent 获取阶梯（preset 编排 / live 接管 / wedged 自愈）')
+  const calls: Array<{ kind: string; args: unknown[] }> = []
+  const listeners: Array<(session: unknown, event: unknown) => void> = []
+
+  /** 构造一个会在 followup 时派发完整事件流的 mock agent。 */
+  function makeAgent(id: string, header: Record<string, unknown> = {}): any {
+    const events: Array<Record<string, unknown>> = []
+    const session = { id, seq: 1, events, header }
+    const agent = {
+      session,
+      disposed: false,
+      whenIdle: async () => undefined,
+      followup: () => {
+        const evs = [
+          { type: 'turn/start', seq: 2, data: {} },
+          { type: 'assistant/message', seq: 3, data: { message: { content: [{ type: 'text', text: '获取阶梯答复' }] } } },
+          { type: 'turn/end', seq: 4, data: { reason: { kind: 'completed' } } },
+        ]
+        for (const e of evs) {
+          events.push(e)
+          for (const l of listeners) l(session, e)
+        }
+      },
+    }
+    return agent
+  }
+
+  /** 执行 setup（installModelSelection 需要 agentCtx.on；preset mount 需要 agentCtx.agent）。 */
+  function runSetup(setup: unknown, agent: any): void {
+    if (typeof setup !== 'function') return
+    const agentCtx = { on: () => () => undefined, agent }
+    void setup(agentCtx)
+  }
+
+  const feishuMock = {
+    replyText: async (messageId: string, text: string) => calls.push({ kind: 'replyText', args: [messageId, text] }),
+    replyMarkdown: async (messageId: string, text: string) => calls.push({ kind: 'replyMarkdown', args: [messageId, text] }),
+    replyCard: async () => { calls.push({ kind: 'replyCard', args: [] }); return 'card-1' },
+    patchCard: async () => calls.push({ kind: 'patchCard', args: [] }),
+    addReaction: async (_m: string, emoji: string) => { calls.push({ kind: 'addReaction', args: [emoji] }); return `r-${emoji}` },
+    removeReaction: async () => { calls.push({ kind: 'removeReaction', args: [] }); return true },
+  } as never
+
+  const p2p: FeishuMessageEvent = {
+    sender: { sender_id: { open_id: 'ou_user' }, sender_type: 'user' },
+    message: {
+      message_id: 'a1', create_time: '1', chat_id: 'oc_p2p', chat_type: 'p2p',
+      message_type: 'text', content: JSON.stringify({ text: '测试获取阶梯' }),
+    },
+  }
+
+  // ---- Bug A：preset-roster 部署下 create 携带 meta.agentPreset 并 mount ----
+  {
+    const file = path.join(os.tmpdir(), `acq-a-${Date.now()}.json`)
+    const sessions = new SessionMap(file)
+    const sid = sessions.idFor('ou_user')
+    const mounted: Array<string | undefined> = []
+    const mockPresets = {
+      resolve: async (id?: string) => ({ id: id ?? 'standard', broken: undefined }),
+      mount: async (_ctx: unknown, id?: string) => { mounted.push(id); return { id: id ?? 'standard' } },
+    }
+    let createdMeta: Record<string, unknown> | undefined
+    let createdSetup: unknown
+    const agents = {
+      get: () => undefined,
+      resume: async () => { throw new Error('session not persisted') },
+      create: async (opts: { sessionId: unknown; meta: Record<string, unknown>; setup: unknown }) => {
+        createdMeta = opts.meta
+        createdSetup = opts.setup
+        return { agent: makeAgent(String(opts.sessionId), { agentPreset: createdMeta?.agentPreset }), dispose: async () => undefined }
+      },
+    }
+    const ctx = {
+      get: (key: string) => key === 'agents' ? agents : key === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'deepseek', model: 'mock' }) }
+        : key === 'agentPresets' ? mockPresets : undefined,
+      on: (_n: string, fn: (s: unknown, e: unknown) => void) => { listeners.push(fn); return () => { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1) } },
+    } as never
+    const handler = new ChatHandler({ ctx, config: resolveConfig({ feishu: { appId: 'a', appSecret: 's', domain: 'feishu' }, sessionsFile: file }), feishu: feishuMock, sessions })
+    calls.length = 0
+    await handler.handleMessage(p2p)
+    ok('A：create 携带 meta.agentPreset', createdMeta?.agentPreset === 'standard', `got=${createdMeta?.agentPreset}`)
+    runSetup(createdSetup, makeAgent(sid, { agentPreset: 'standard' }))
+    await new Promise((r) => setTimeout(r, 10))
+    ok('A：setup 中 mount 了 preset', mounted.includes('standard'), `mounted=${JSON.stringify(mounted)}`)
+    ok('A：正常返回答复', calls.some((c) => c.kind === 'replyMarkdown'))
+  }
+
+  // ---- Bug B：live 会话被 agents.get() 接管，不再 resume/create ----
+  {
+    const file = path.join(os.tmpdir(), `acq-b-${Date.now()}.json`)
+    const sessions = new SessionMap(file)
+    const sid = sessions.idFor('ou_user')
+    const live = makeAgent(sid)
+    let resumeCount = 0
+    let createCount = 0
+    const agents = {
+      get: (id: unknown) => String(id) === sid ? live : undefined,
+      resume: async () => { resumeCount++; throw new Error('while it is live') },
+      create: async () => { createCount++; throw new Error('already exists') },
+    }
+    const ctx = {
+      get: (key: string) => key === 'agents' ? agents : key === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'deepseek', model: 'mock' }) } : undefined,
+      on: (_n: string, fn: (s: unknown, e: unknown) => void) => { listeners.push(fn); return () => { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1) } },
+    } as never
+    const handler = new ChatHandler({ ctx, config: resolveConfig({ feishu: { appId: 'a', appSecret: 's', domain: 'feishu' }, sessionsFile: file }), feishu: feishuMock, sessions })
+    calls.length = 0
+    await handler.handleMessage(p2p)
+    ok('B：接管 live agent（不 resume/create）', resumeCount === 0 && createCount === 0)
+    ok('B：接管后正常答复', calls.some((c) => c.kind === 'replyMarkdown' && c.args[1] === '获取阶梯答复'))
+    ok('B：不 dispose 共享 agent', (live as { disposed: boolean }).disposed === false)
+  }
+
+  // ---- Bug C：wedged 会话 → 换新 id 并更新映射 ----
+  {
+    const file = path.join(os.tmpdir(), `acq-c-${Date.now()}.json`)
+    const sessions = new SessionMap(file)
+    const sid = sessions.idFor('ou_user')
+    const createdIds: string[] = []
+    const agents = {
+      get: () => undefined,
+      resume: async () => { throw new Error('persistence recovery failed') },
+      create: async (opts: { sessionId: unknown; meta: Record<string, unknown> }) => {
+        createdIds.push(String(opts.sessionId))
+        if (createdIds.length === 1) throw new Error(`session "${opts.sessionId}" already exists`)
+        return { agent: makeAgent(String(opts.sessionId)), dispose: async () => undefined }
+      },
+    }
+    const ctx = {
+      get: (key: string) => key === 'agents' ? agents : key === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'deepseek', model: 'mock' }) } : undefined,
+      on: (_n: string, fn: (s: unknown, e: unknown) => void) => { listeners.push(fn); return () => { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1) } },
+    } as never
+    const handler = new ChatHandler({ ctx, config: resolveConfig({ feishu: { appId: 'a', appSecret: 's', domain: 'feishu' }, sessionsFile: file }), feishu: feishuMock, sessions })
+    calls.length = 0
+    await handler.handleMessage(p2p)
+    ok('C：首次 create 冲突', createdIds.length === 2 && createdIds[0] === sid)
+    ok('C：换新 id 创建', createdIds.length === 2 && createdIds[1] !== sid && createdIds[1].startsWith('feishu-'))
+    ok('C：映射已重指向新 id', sessions.infoForSession(createdIds[1]) !== undefined)
+    ok('C：自愈后正常答复', calls.some((c) => c.kind === 'replyMarkdown' && c.args[1] === '获取阶梯答复'))
+    // 同一会话下一问 → 直接用新 id（映射已更新）
+    const before = createdIds.length
+    await handler.handleMessage({ ...p2p, message: { ...p2p.message, message_id: 'a2', content: JSON.stringify({ text: '再问一次' }) } })
+    ok('C：后续消息复用新 id', createdIds.length === before + 1 && createdIds[createdIds.length - 1] === createdIds[1])
+  }
+}
+
 async function main(): Promise<void> {
   testParsing()
   testSplit()
@@ -332,6 +483,7 @@ async function main(): Promise<void> {
   testSummarize()
   await testChatHandler()
   await testInteractions()
+  await testAcquisition()
   console.log(`\n自测完成：${passed} 项通过${process.exitCode ? '（有失败）' : ''}`)
 }
 
