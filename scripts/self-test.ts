@@ -307,6 +307,10 @@ async function testInteractions(): Promise<void> {
       return `card-${calls.length}`
     },
     patchCard: async (messageId: string, card: unknown) => calls.push({ kind: 'patchCard', args: [messageId, card] }),
+    deleteMessage: async (messageId: string) => {
+      calls.push({ kind: 'deleteMessage', args: [messageId] })
+      return true
+    },
   } as never
 
   const ctx = {
@@ -337,11 +341,40 @@ async function testInteractions(): Promise<void> {
   const approveValue = card.elements[1]?.actions?.[0]?.value as { id: string } | undefined
   ok('审批：卡片带允许按钮', approveValue !== undefined && typeof approveValue.id === 'string')
 
-  // 模拟点击"允许"
-  await svc.handleCardAction({ messageId: 'card-1', chatId: 'oc_p2p', action: { value: { kind: 'approval', id: approveValue!.id } } } as never)
+  // 模拟点击"允许"——响应应含 toast + 无按钮处理态卡片
+  const clickResponse = await svc.handleCardAction({ messageId: 'card-1', chatId: 'oc_p2p', action: { value: { kind: 'approval', id: approveValue!.id } } } as never)
   const outcome = await pending
   ok('审批：点击后返回 allowed-once', outcome === 'allowed-once')
-  ok('审批：卡片更新为已处理', calls.some((c) => c.kind === 'patchCard'))
+  ok('审批：回调响应带 toast', (clickResponse as { toast?: { content?: string } })?.toast?.content?.includes('已允许') === true)
+  const respCard = (clickResponse as { card?: { data?: { elements?: Array<{ tag: string }> } } })?.card?.data
+  ok('审批：响应卡片无按钮', respCard !== undefined && !respCard.elements?.some((e) => e.tag === 'action'))
+  ok('审批：REST 兜底 patch 已处理', calls.some((c) => c.kind === 'patchCard'))
+  const patched = calls.find((c) => c.kind === 'patchCard')?.args[1] as { elements?: Array<{ tag: string }> }
+  ok('审批：兜底卡片也无按钮', patched !== undefined && !patched.elements?.some((e) => e.tag === 'action'))
+
+  // recall 模式：点击后撤回卡片（响应只含 toast）
+  calls.length = 0
+  const svcRecall = new InteractionService({
+    ctx,
+    config: { interactions: { approvalCardDispose: 'recall' } } as never,
+    feishu: feishuMock,
+    sessions,
+  })
+  svcRecall.registerApprovalAnswerer()
+  const pendingRecall = approvalListeners[1]!(
+    { agent: { session: { id: sessionId } }, toolName: 'bash', reason: 'again' },
+    () => Promise.resolve('unavailable'),
+  )
+  await new Promise((r) => setTimeout(r, 10))
+  const pushed2 = calls.find((c) => c.kind === 'push')?.args[0] as { content: string }
+  const card2 = JSON.parse(pushed2.content) as { elements: Array<{ actions?: Array<{ value?: unknown }> }> }
+  const approveValue2 = card2.elements[1]?.actions?.[0]?.value as { id: string } | undefined
+  const recallResponse = await svcRecall.handleCardAction({ messageId: 'card-2', chatId: 'oc_p2p', action: { value: { kind: 'approval', id: approveValue2!.id } } } as never)
+  await pendingRecall
+  await new Promise((r) => setTimeout(r, 10))
+  ok('recall：响应只含 toast 不含卡片', (recallResponse as { card?: unknown })?.card === undefined && (recallResponse as { toast?: unknown })?.toast !== undefined)
+  ok('recall：调用撤回接口', calls.some((c) => c.kind === 'deleteMessage'))
+  svcRecall.dispose()
 
   // 非 Feishu 会话 → 委托 next()
   const delegated = await approvalListeners[0]!(

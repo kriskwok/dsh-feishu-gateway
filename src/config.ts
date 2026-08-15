@@ -74,6 +74,16 @@ export interface FeishuGatewayConfig {
     approvalCards?: boolean
     /** Answer the model's `ask_user_question` tool with Feishu cards (click options). */
     userQuestionsCards?: boolean
+    /**
+     * What happens to the approval card after the user clicks.
+     * - `'update'` (recommended): the click response instantly replaces the
+     *   card with a decided state (buttons removed, result shown) + a toast.
+     *   Feishu's recall API would leave a "撤回了一条消息" placeholder, so this
+     *   is the cleanest available "processed" interaction.
+     * - `'recall'`: recall the card message (it disappears behind Feishu's
+     *   recall placeholder); falls back to `'update'` when recall fails.
+     */
+    approvalCardDispose?: 'update' | 'recall'
   }
   /** Regex list that resets the conversation (e.g. `/new`, "另起会话"). */
   newSessionPatterns?: string[]
@@ -111,6 +121,7 @@ export const Config: Schema<FeishuGatewayConfig> = z.object({
   interactions: z.object({
     approvalCards: z.boolean().default(true),
     userQuestionsCards: z.boolean().default(true),
+    approvalCardDispose: z.union([z.const('update'), z.const('recall')]).default('update'),
   }),
   newSessionPatterns: z
     .array(z.string())

@@ -34,6 +34,18 @@ export interface CardBody {
   }>
 }
 
+/**
+ * `card.action.trigger` callback response (returned over the long connection).
+ * Feishu honors this within 3s of the click: `toast` shows a client toast and
+ * `card` instantly replaces the card content (方式一: immediate update). The
+ * card schema has no button `disabled` state, so "disabling" the buttons means
+ * replacing the card with a decided state that has no actions.
+ */
+export interface CardActionResponse {
+  toast?: { type: 'info' | 'success' | 'error' | 'warning'; content: string }
+  card?: { type: 'raw'; data: CardBody }
+}
+
 export type MessageType = 'text' | 'post' | 'interactive' | 'image' | 'file' | 'audio' | 'media'
 export type ReceiveIdType = 'open_id' | 'user_id' | 'union_id' | 'email' | 'chat_id'
 
@@ -88,12 +100,15 @@ export class FeishuClient {
     /**
      * Interactive card button clicks (`card.action.trigger`), delivered over the
      * same long connection. `value` carries the opaque payload the card buttons
-     * were built with (e.g. the approval / question id).
+     * were built with (e.g. the approval / question id). Return a
+     * {@link CardActionResponse} to show a toast and/or instantly update the card.
      */
-    'card.action.trigger'?: (data: CardActionEvent) => Promise<void> | void
-    [eventName: string]: ((data: any) => Promise<void> | void) | undefined
+    'card.action.trigger'?: (
+      data: CardActionEvent,
+    ) => Promise<CardActionResponse | void> | CardActionResponse | void
+    [eventName: string]: ((data: any) => Promise<unknown> | unknown) | undefined
   }): Promise<void> {
-    const dispatcherHandlers: Record<string, ((data: any) => Promise<void> | void) | undefined> = { ...handlers }
+    const dispatcherHandlers: Record<string, ((data: any) => Promise<unknown> | unknown) | undefined> = { ...handlers }
     if (handlers['card.action.trigger'] !== undefined) {
       dispatcherHandlers['card.action.trigger'] = (raw: Record<string, unknown>) =>
         handlers['card.action.trigger']!(normalizeCardAction(raw))
@@ -194,6 +209,24 @@ export class FeishuClient {
       data: { content: JSON.stringify(card) },
     })
     this.assertOk(res, 'patchCard')
+  }
+
+  /**
+   * Recall (delete) a message this bot sent. NOTE: Feishu shows a
+   * "撤回了一条消息" placeholder at the original position — this is not a clean
+   * disappearance. Best-effort; returns false when the recall is rejected.
+   */
+  async deleteMessage(messageId: string): Promise<boolean> {
+    try {
+      const res = await this.client.im.message.delete({
+        path: { message_id: messageId },
+      })
+      this.assertOk(res, 'deleteMessage')
+      return true
+    } catch (err) {
+      logger.warn('feishu', `deleteMessage ${messageId} failed:`, err)
+      return false
+    }
   }
 
   /**

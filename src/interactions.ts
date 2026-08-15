@@ -30,7 +30,7 @@ import type {
   AskUserQuestionItem,
   AskUserQuestionRequest,
 } from '@deepseek-ai/dsh-user-questions'
-import type { CardActionEvent, CardBody, FeishuClient } from './feishu.js'
+import type { CardActionEvent, CardActionResponse, CardBody, FeishuClient } from './feishu.js'
 import type { SessionMap } from './session-map.js'
 import type { FeishuGatewayConfig } from './config.js'
 import { logger } from './logger.js'
@@ -92,19 +92,25 @@ export class InteractionService {
 
   constructor(private readonly deps: InteractionServiceDeps) {}
 
-  /** Route one `card.action.trigger` (button click) to its pending interaction. */
-  handleCardAction = async (data: CardActionEvent): Promise<void> => {
+  /**
+   * Route one `card.action.trigger` (button click) to its pending interaction.
+   * Returns the callback response: a toast + the instantly-updated decided card
+   * (buttons removed), which Feishu applies within 3s of the click.
+   */
+  handleCardAction = async (data: CardActionEvent): Promise<CardActionResponse | void> => {
     const value = data.action?.value
     if (typeof value !== 'object' || value === null) return
     const cardValue = value as CardValue
     try {
       if (cardValue.kind === 'approval') {
-        await this.settleApproval(data, cardValue)
-      } else if (cardValue.kind === 'question') {
-        await this.settleQuestion(data, cardValue)
+        return this.settleApproval(data, cardValue)
+      }
+      if (cardValue.kind === 'question') {
+        return this.settleQuestion(data, cardValue)
       }
     } catch (err) {
       logger.error('interactions', 'handle card action error:', err)
+      return { toast: { type: 'error', content: '处理失败，请重试' } }
     }
   }
 
@@ -202,7 +208,9 @@ export class InteractionService {
         resolve,
         settled: false,
       }
-      const onAbort = (): void => this.settleApprovalNow(pending, 'cancelled')
+      const onAbort = (): void => {
+        this.settleApprovalNow(pending, 'cancelled')
+      }
       pending.onAbort = onAbort
       req.signal?.addEventListener('abort', onAbort, { once: true })
       this.approvals.set(id, pending)
@@ -254,29 +262,49 @@ export class InteractionService {
     logger.info('interactions', `approval ${pending.id} card pushed → ${pending.chatId}`)
   }
 
-  private async settleApproval(data: CardActionEvent, value: ApprovalCardValue): Promise<void> {
+  private settleApproval(data: CardActionEvent, value: ApprovalCardValue): CardActionResponse {
     const pending = this.approvals.get(value.id)
-    if (pending === undefined || pending.settled) return
-    if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return
-    this.settleApprovalNow(pending, value.reject === true ? 'rejected' : 'allowed-once')
+    if (pending === undefined || pending.settled) return {}
+    if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return {}
+    const outcome: ApprovalOutcome = value.reject === true ? 'rejected' : 'allowed-once'
+    const card = this.settleApprovalNow(pending, outcome)
+    const toast: CardActionResponse['toast'] =
+      outcome === 'allowed-once'
+        ? { type: 'success', content: '✅ 已允许（一次性）' }
+        : { type: 'info', content: '🚫 已拒绝' }
+    // `recall` mode: recall the card message instead of updating it; falls
+    // back to the decided-state update when the recall is rejected.
+    if (pending.cardMessageId && (this.deps.config.interactions?.approvalCardDispose ?? 'update') === 'recall') {
+      void this.recallCard(pending.cardMessageId, card)
+      return { toast }
+    }
+    return { toast, ...card === undefined ? {} : { card: { type: 'raw', data: card } } }
   }
 
-  private settleApprovalNow(pending: PendingApproval, outcome: ApprovalOutcome): void {
-    if (pending.settled) return
+  /**
+   * Settle a pending approval. Resolves the outcome, then builds the decided
+   * card (buttons removed) and best-effort patches it over REST as a fallback
+   * for the response-side update. Returns the decided card for the callback
+   * response.
+   */
+  private settleApprovalNow(pending: PendingApproval, outcome: ApprovalOutcome): CardBody | undefined {
+    if (pending.settled) return undefined
     pending.settled = true
     pending.onAbort?.()
     this.approvals.delete(pending.id)
     pending.resolve(outcome)
+    const label =
+      outcome === 'allowed-once'
+        ? '✅ 已允许（一次性）'
+        : outcome === 'rejected'
+          ? '🚫 已拒绝'
+          : '⏹️ 已取消'
+    const card = this.buildDecidedCard('🔐 授权', label, outcome === 'allowed-once' ? 'green' : 'red')
     if (pending.cardMessageId) {
-      const label =
-        outcome === 'allowed-once'
-          ? '✅ 已允许（一次性）'
-          : outcome === 'rejected'
-            ? '🚫 已拒绝'
-            : '⏹️ 已取消'
-      this.patchDecidedCard(pending.cardMessageId, '🔐 授权', label, outcome === 'allowed-once' ? 'green' : 'red').catch(() => undefined)
+      void this.deps.feishu.patchCard(pending.cardMessageId, card).catch(() => undefined)
     }
     logger.info('interactions', `approval ${pending.id} → ${outcome}`)
+    return card
   }
 
   // ---------------------------------------------------------------------------
@@ -364,28 +392,35 @@ export class InteractionService {
     logger.info('interactions', `question ${pending.id} card pushed → ${pending.chatId}`)
   }
 
-  private async settleQuestion(data: CardActionEvent, value: QuestionCardValue): Promise<void> {
+  private settleQuestion(data: CardActionEvent, value: QuestionCardValue): CardActionResponse {
     const pending = this.questions.get(value.id)
-    if (pending === undefined || pending.settled) return
-    if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return
+    if (pending === undefined || pending.settled) return {}
+    if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return {}
     const selected = value.label !== undefined ? [value.label] : []
-    this.settleQuestionNow(pending, {
+    const card = this.settleQuestionNow(pending, {
       answers: pending.questions.map((q) => ({ id: q.id, selected })),
     })
     logger.info('interactions', `question ${pending.id} answered by card click: ${selected.join(', ') || '(none)'}`)
+    const label = selected.join('、') || '已提交'
+    return {
+      toast: { type: 'success', content: `✅ 已选择：${truncate(label, 20)}` },
+      ...card === undefined ? {} : { card: { type: 'raw', data: card } },
+    }
   }
 
-  private settleQuestionNow(pending: PendingQuestion, answer: AskUserQuestionAnswer): void {
-    if (pending.settled) return
+  private settleQuestionNow(pending: PendingQuestion, answer: AskUserQuestionAnswer): CardBody | undefined {
+    if (pending.settled) return undefined
     pending.settled = true
     pending.onAbort?.()
     this.questions.delete(pending.id)
     pending.resolve(answer)
+    const selected = answer.answers[0]?.selected ?? []
+    const label = selected.length > 0 ? selected.join('、') : (answer.answers[0]?.custom ?? '已作答')
+    const card = this.buildDecidedCard('❓ 问答', `你的选择：**${truncate(escapeMd(label), 60)}**`, 'green')
     if (pending.cardMessageId) {
-      const selected = answer.answers[0]?.selected ?? []
-      const label = selected.length > 0 ? selected.join('、') : (answer.answers[0]?.custom ?? '已作答')
-      this.patchDecidedCard(pending.cardMessageId, '❓ 问答', `你的选择：**${truncate(escapeMd(label), 60)}**`, 'green').catch(() => undefined)
+      void this.deps.feishu.patchCard(pending.cardMessageId, card).catch(() => undefined)
     }
+    return card
   }
 
   // ---------------------------------------------------------------------------
@@ -414,9 +449,13 @@ export class InteractionService {
     return undefined
   }
 
-  /** Patch a card into its decided state (disable buttons, show the result). */
-  private async patchDecidedCard(messageId: string, title: string, body: string, template: 'green' | 'red'): Promise<void> {
-    const card: CardBody = {
+  /**
+   * Build the decided card for a settled interaction: buttons removed, the
+   * outcome shown, and a "processed" note — Feishu's card schema has no button
+   * `disabled` state, so this IS the "grayed-out" interaction.
+   */
+  private buildDecidedCard(title: string, body: string, template: 'green' | 'red'): CardBody {
+    return {
       config: { wide_screen_mode: true },
       header: { title: { tag: 'plain_text', content: title }, template },
       elements: [
@@ -424,7 +463,14 @@ export class InteractionService {
         { tag: 'note', elements: [{ tag: 'plain_text', content: '该卡片已处理，无需再次操作。' }] },
       ],
     }
-    await this.deps.feishu.patchCard(messageId, card)
+  }
+
+  /** `recall` mode: delete the card message; fall back to the decided patch. */
+  private async recallCard(cardMessageId: string, fallbackCard?: CardBody): Promise<void> {
+    const deleted = await this.deps.feishu.deleteMessage(cardMessageId)
+    if (!deleted && fallbackCard !== undefined) {
+      await this.deps.feishu.patchCard(cardMessageId, fallbackCard).catch(() => undefined)
+    }
   }
 }
 

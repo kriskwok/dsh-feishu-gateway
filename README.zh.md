@@ -27,7 +27,8 @@ Markdown 富文本（post 消息的 md 标签）回复。支持 `/new` 开启全
   设为 `reporting.mode: 'final'` 则只显示最终结果。
 - 🃏 **点击即答卡片** — 权限审批（`approval/request`，如沙箱提权）与模型的
   `ask_user_question` 工具会渲染成飞书交互卡片：点 **✅ 允许一次 / 🚫 拒绝**
-  或选项按钮即可作答。
+  或选项按钮即可作答。点击后回调响应会瞬间把卡片替换为已处理态
+  （按钮移除、显示结果）并弹出 toast 确认。
 - ✍️ **Markdown 回复** — 用普通富文本（post）消息的 `md` 标签：粗体、行内代码、
   列表、链接原生渲染，无需卡片
 - 🤖 **完整 agent 能力** — DSH agent 自带模型与工具（bash、文件、子代理…），完全自主
@@ -173,6 +174,7 @@ dsh --profile feishu
 | `reporting.cardTitleDone` | `🤖 DSH 处理完成` | 完成卡片标题（绿色头）可自定义 |
 | `interactions.approvalCards` | `true` | 权限审批用可点击卡片回答 |
 | `interactions.userQuestionsCards` | `true` | `ask_user_question` 用可点击卡片回答 |
+| `interactions.approvalCardDispose` | `update` | 审批卡片点击后：`update`=回调响应瞬间替换为已处理态（按钮移除+结果+toast）；`recall`=撤回卡片消息（失败自动回退 update；注意飞书会在原位显示"撤回了一条消息"占位） |
 | `newSessionPatterns` | `/new` 及中文短语 | 触发另起会话的正则列表 |
 | `sessionsFile` | `data/dsh-feishu-sessions.json` | 会话映射持久化文件 |
 | `http.port` | `0` | 管理 API 端口（`0`=禁用） |

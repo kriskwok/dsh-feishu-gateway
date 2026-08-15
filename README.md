@@ -34,6 +34,8 @@ push.
 - 🃏 **Click-to-answer cards** — permission approvals (`approval/request`, e.g.
   sandbox escalation) and the model's `ask_user_question` tool render as Feishu
   interactive cards: click **✅ 允许一次 / 🚫 拒绝** or an option button to answer.
+  The click response instantly replaces the card with a decided state (buttons
+  removed, result shown) plus a toast confirmation.
 - ✍️ **Markdown replies** — plain rich-text (`post`) messages with the `md`
   tag: bold, inline code, lists and links render natively, no cards needed
 - 🤖 **Full agent capability** — the DSH agent runs with its own model and
@@ -190,6 +192,7 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 | `reporting.cardTitleDone` | `🤖 DSH 处理完成` | Custom title of the streaming card when complete (green header) |
 | `interactions.approvalCards` | `true` | Answer permission approvals with clickable cards |
 | `interactions.userQuestionsCards` | `true` | Answer `ask_user_question` with clickable cards |
+| `interactions.approvalCardDispose` | `update` | After an approval-card click: `update` instantly replaces the card with a decided state (buttons removed, result shown) + toast; `recall` recalls the card message (falls back to `update` when recall fails — note Feishu leaves a "撤回了一条消息" placeholder) |
 | `newSessionPatterns` | `/new` + Chinese phrases | Regexes that reset the session |
 | `sessionsFile` | `data/dsh-feishu-sessions.json` | Session mapping persistence |
 | `http.port` | `0` | Admin API port (`0` disables) |
