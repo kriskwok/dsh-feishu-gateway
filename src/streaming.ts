@@ -8,7 +8,12 @@
  * final full answer is still delivered as a Markdown post by the chat handler.
  *
  * Card patches are throttled (`reporting.patchIntervalMs`) because Feishu
- * rate-limits card updates, and the rendered body is truncated
+ * rate-limits card updates to roughly once per second per message (error
+ * 230020, "Update the single messages too frequently"). The default interval
+ * is 1100 ms (safely under the 1/s limit), and a patch failure backs off
+ * adaptively (doubling the effective interval, resetting on success) so even
+ * a user-configured low interval or a transient hiccup degrades gracefully
+ * instead of hammering the API. The rendered body is truncated
  * (`reporting.maxBodyChars`) because the card payload is size-limited. The
  * card uses Feishu's native `streaming_mode` so the client shows a live
  * "generating" state while patches keep coming.
@@ -45,6 +50,8 @@ export class TurnReporter {
   private patchTimer: ReturnType<typeof setTimeout> | undefined
   private pendingPatch = false
   private finished = false
+  /** Multiplier applied to the patch interval after a failed (rate-limited) patch. */
+  private backoff = 1
   private readonly startedAt = Date.now()
   private readonly patchIntervalMs: number
   private readonly maxBodyChars: number
@@ -58,7 +65,7 @@ export class TurnReporter {
     private readonly opts: TurnReporterOptions,
   ) {
     const reporting = deps.config.reporting ?? {}
-    this.patchIntervalMs = Math.max(200, reporting.patchIntervalMs ?? 700)
+    this.patchIntervalMs = Math.max(200, reporting.patchIntervalMs ?? 1100)
     this.maxBodyChars = Math.max(200, reporting.maxBodyChars ?? 900)
     this.showReasoning = reporting.showReasoning ?? true
     this.showToolCalls = reporting.showToolCalls ?? true
@@ -174,22 +181,35 @@ export class TurnReporter {
     if (this.pendingPatch || this.finished) return
     this.pendingPatch = true
     const elapsed = Date.now() - this.lastPatchAt
-    const delay = Math.max(0, this.patchIntervalMs - elapsed)
+    // Back off on repeated failures so a rate-limited card does not get
+    // hammered; `backoff` resets on the next successful patch.
+    const delay = Math.max(0, this.patchIntervalMs * this.backoff - elapsed)
     this.patchTimer = setTimeout(() => {
       this.patchTimer = undefined
-      this.pendingPatch = false
       void this.flush()
     }, delay)
   }
 
   private async flush(): Promise<void> {
-    if (this.finished || this.cardMessageId === undefined) return
-    const card = this.buildCard(true)
     try {
+      if (this.finished || this.cardMessageId === undefined) return
+      const card = this.buildCard(true)
       await this.deps.feishu.patchCard(this.cardMessageId, card)
       this.lastPatchAt = Date.now()
+      this.backoff = 1
     } catch (err) {
       logger.debug('streaming', 'card patch failed:', err)
+      // Doubling the interval (up to 8×) on failure makes the stream survive
+      // Feishu's per-message rate limit (230020) with minimal lost updates.
+      this.backoff = Math.min(this.backoff * 2, 8)
+      this.lastPatchAt = Date.now()
+    } finally {
+      // The debounce window stays held until the whole patch settles. Clearing
+      // `pendingPatch` here (instead of in the timer callback) prevents a
+      // second patch from being scheduled while this one is mid-flight — the
+      // old race let overlapping patches hit the same card in a burst, which
+      // is exactly what trips Feishu's per-message update limit (230020).
+      this.pendingPatch = false
     }
   }
 

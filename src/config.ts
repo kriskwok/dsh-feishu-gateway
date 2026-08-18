@@ -112,7 +112,7 @@ export const Config: Schema<FeishuGatewayConfig> = z.object({
     typingReaction: z.boolean().default(true),
     showReasoning: z.boolean().default(true),
     showToolCalls: z.boolean().default(true),
-    patchIntervalMs: z.number().default(700),
+    patchIntervalMs: z.number().default(1100),
     maxBodyChars: z.number().default(900),
     failureReaction: z.string().default('CrossMark'),
     cardTitleStreaming: z.string().default('🤖 DSH 处理中…'),
