@@ -199,11 +199,13 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 | `http.token` | `` | Admin API bearer token |
 
 > **Q&A cards in the web profile**: `ask_user_question` answers go through the
-> single `ctx.userQuestions` provider slot. When the DSH Web UI runs in the
-> same process (recommended setup), the Web UI owns that slot, so
-> `ask_user_question` is answered there; permission-approval cards still work
-> from Feishu in every setup. In a standalone feishu profile, both
-> `ask_user_question` and approvals are answered from Feishu cards.
+> single `ctx.userQuestions` provider slot, which the DSH Web UI owns when it
+> runs in the same process (recommended setup). The gateway keeps that provider
+> and bridges at the service boundary: sessions owned by a Feishu conversation
+> are answered with Feishu cards, while every other session continues through
+> the Web UI provider. Permission-approval cards work from Feishu in every
+> setup. In a standalone feishu profile, both `ask_user_question` and approvals
+> are answered from Feishu cards.
 
 ## Session coexistence & self-healing
 

@@ -182,9 +182,10 @@ dsh --profile feishu
 
 > **web profile 下的问答卡片**：`ask_user_question` 的作答走唯一的
 > `ctx.userQuestions` provider 槽位。当 Web UI 与网关同进程（推荐部署）时该槽位
-> 归 Web UI，因此 `ask_user_question` 在 Web UI 中作答；而**权限审批卡片在任何
-> 部署下都从飞书作答**。独立 feishu profile 下，`ask_user_question` 与审批都在
-> 飞书卡片中作答。
+> 归 Web UI，网关会保留该 provider 并在服务边界做桥接：**飞书会话的提问用飞书
+> 卡片作答**，其余会话继续走 Web UI provider。**权限审批卡片在任何部署下都从
+> 飞书作答**。独立 feishu profile 下，`ask_user_question` 与审批都在飞书卡片中
+> 作答。
 
 ## 会话共存与自愈
 

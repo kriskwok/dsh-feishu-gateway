@@ -11,12 +11,15 @@
  *    sessions this gateway does not own are delegated via `next()` so the web
  *    UI (or the fail-closed default) still answers them.
  * 2. **The model's `ask_user_question` tool** — via `ctx.userQuestions`. The
- *    gateway registers itself as the single user-questions provider when the
- *    slot is free (standalone profile); when the DSH Web UI already owns the
- *    provider, registration is skipped with an info log (the web UI answers
- *    those questions instead). Questions with options render clickable option
- *    buttons; option-less questions are answered by replying with text in the
- *    chat.
+ *    gateway registers itself as the user-questions provider when the slot is
+ *    free (standalone profile). In a web profile the DSH Web UI already owns
+ *    the single provider slot, so the gateway keeps that provider alive and
+ *    bridges at the service boundary: sessions owned by a Feishu conversation
+ *    are answered with Feishu cards, every other session continues through the
+ *    Web UI provider. Questions with options render clickable option buttons;
+ *    option-less questions are answered by replying with text in the chat.
+ *    Multi-question requests advance one card per question and settle once the
+ *    last question is answered.
  *
  * Card clicks arrive over the same Feishu long connection as
  * `card.action.trigger` and are routed by the opaque `value` carried on the
@@ -48,6 +51,8 @@ interface QuestionCardValue {
   kind: 'question'
   /** The pending-question registry id. */
   id: string
+  /** Question index in a multi-question request; absent on pre-bridge cards. */
+  index?: number
   /** Selected option label, when clicked from an option button. */
   label?: string
 }
@@ -71,6 +76,10 @@ interface PendingQuestion {
   userOpenId: string
   cardMessageId?: string
   questions: AskUserQuestionItem[]
+  /** Index of the question the flow is currently asking (0-based). */
+  currentIndex: number
+  /** Answers collected per question while the card flow advances. */
+  drafts: Array<{ selected: string[]; custom?: string }>
   resolve: (answer: AskUserQuestionAnswer) => void
   onAbort?: () => void
   settled: boolean
@@ -124,13 +133,14 @@ export class InteractionService {
     for (const pending of this.questions.values()) {
       if (pending.settled || pending.chatId !== chatId) continue
       if (pending.userOpenId && userOpenId && pending.userOpenId !== userOpenId) continue
-      // Free-text answering only applies to option-less questions; option
-      // questions must be answered by clicking the card buttons.
-      if (pending.questions.some((q) => (q.options?.length ?? 0) > 0)) continue
-      this.settleQuestionNow(pending, {
-        answers: pending.questions.map((q) => ({ id: q.id, selected: [], custom: text })),
-      })
-      logger.info('interactions', `question ${pending.id} answered by text (${chatId})`)
+      // Free-text answering applies to the current question only, and only when
+      // it is option-less; option questions must be answered by clicking the
+      // card buttons.
+      const current = pending.questions[pending.currentIndex]
+      if (current === undefined || (current.options?.length ?? 0) > 0) continue
+      const index = pending.currentIndex
+      this.answerCurrentQuestion(pending, { selected: [], custom: text })
+      logger.info('interactions', `question ${pending.id} [${index + 1}/${pending.questions.length}] answered by text (${chatId})`)
       return true
     }
     return false
@@ -149,9 +159,10 @@ export class InteractionService {
   }
 
   /**
-   * Register as the `ctx.userQuestions` provider. Only one provider can be
-   * active; when the DSH Web UI already owns it this is skipped with an info
-   * log (standalone feishu profiles get Feishu card Q&A).
+   * Register the Feishu question provider. In the Web profile the official UI
+   * provider is already installed, so registering a second provider is rejected
+   * by DSH. Wrap `ask()` in that case and route only Feishu-owned sessions to
+   * cards; all other sessions continue through the Web UI provider.
    */
   registerUserQuestionsProvider(): void {
     const enabled = this.deps.config.interactions?.userQuestionsCards ?? true
@@ -161,16 +172,31 @@ export class InteractionService {
       logger.warn('interactions', 'ctx.userQuestions unavailable; Feishu card Q&A disabled')
       return
     }
+    const provider = { ask: (request: AskUserQuestionRequest) => this.askUser(request) }
     try {
-      const dispose = service.registerProvider({
-        ask: (request: AskUserQuestionRequest) => this.askUser(request),
-      })
+      const dispose = service.registerProvider(provider)
       this.disposers.push(dispose)
       logger.info('interactions', 'registered as ctx.userQuestions provider (Feishu card Q&A)')
+      return
     } catch (err) {
+      // The Web UI owns the single provider in a web profile. Keep that
+      // provider alive and multiplex at the service boundary instead of
+      // silently losing Feishu questions.
+      const originalAsk = service.ask.bind(service)
+      const bridgedAsk = (request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> => {
+        const sessionId = request.agent?.id
+        return sessionId !== undefined && this.resolveConversation(sessionId) !== undefined
+          ? this.askUser(request)
+          : originalAsk(request)
+      }
+      const mutableService = service as typeof service & { ask: typeof service.ask }
+      mutableService.ask = bridgedAsk
+      this.disposers.push(() => {
+        if (mutableService.ask === bridgedAsk) mutableService.ask = originalAsk
+      })
       logger.info(
         'interactions',
-        `ctx.userQuestions provider already registered (Web UI owns it): ${err instanceof Error ? err.message : String(err)} — Feishu card Q&A skipped`,
+        `ctx.userQuestions provider already registered; Feishu sessions bridged alongside Web UI: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
   }
@@ -328,6 +354,8 @@ export class InteractionService {
         chatId: conv.chatId,
         userOpenId: conv.userOpenId,
         questions: request.questions,
+        currentIndex: 0,
+        drafts: request.questions.map(() => ({ selected: [] })),
         resolve,
         settled: false,
       }
@@ -351,27 +379,28 @@ export class InteractionService {
     })
   }
 
-  private async pushQuestionCard(pending: PendingQuestion): Promise<void> {
-    const [first] = pending.questions
-    const options = first?.options ?? []
+  private async pushQuestionCard(pending: PendingQuestion, index = 0): Promise<void> {
+    const question = pending.questions[index]
+    if (question === undefined) return
+    const options = question.options ?? []
     const lines: string[] = []
-    if (first?.header) lines.push(`**${escapeMd(first.header)}**`)
-    lines.push(escapeMd(first?.question ?? '请回答：'))
-    if (first?.detail) lines.push(`> ${escapeMd(first.detail)}`)
+    if (question.header) lines.push(`**${escapeMd(question.header)}**`)
+    lines.push(escapeMd(question.question ?? '请回答：'))
+    if (question.detail) lines.push(`> ${escapeMd(question.detail)}`)
     const elements: NonNullable<CardBody['elements']> = [
       { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n\n') } },
     ]
     if (options.length > 0) {
       elements.push({
         tag: 'action',
-        actions: options.map((option, index) => ({
+        actions: options.map((option, optionIndex) => ({
           tag: 'button',
           text: { tag: 'plain_text', content: truncate(option.label, 24) },
-          type: index === 0 ? 'primary' : 'default',
-          value: { kind: 'question', id: pending.id, label: option.label } satisfies QuestionCardValue,
+          type: optionIndex === 0 ? 'primary' : 'default',
+          value: { kind: 'question', id: pending.id, index, label: option.label } satisfies QuestionCardValue,
         })),
       })
-      if (first?.multiSelect === true) {
+      if (question.multiSelect === true) {
         elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '多选问题：点击任意选项即提交该选项。' }] })
       }
     } else {
@@ -396,16 +425,63 @@ export class InteractionService {
     const pending = this.questions.get(value.id)
     if (pending === undefined || pending.settled) return {}
     if (data.chatId && pending.chatId && data.chatId !== pending.chatId) return {}
-    const selected = value.label !== undefined ? [value.label] : []
-    const card = this.settleQuestionNow(pending, {
-      answers: pending.questions.map((q) => ({ id: q.id, selected })),
-    })
-    logger.info('interactions', `question ${pending.id} answered by card click: ${selected.join(', ') || '(none)'}`)
-    const label = selected.join('、') || '已提交'
+    // Cards carry the index of the question they were pushed for; a click on an
+    // already-answered card (the flow advanced past it) is stale and ignored.
+    const index = value.index ?? pending.currentIndex
+    if (index !== pending.currentIndex) return {}
+    if (value.label === undefined) return {}
+    const more = pending.currentIndex < pending.questions.length - 1
+    const card = this.answerCurrentQuestion(pending, { selected: [value.label] })
+    logger.info('interactions', `question ${pending.id} [${index + 1}/${pending.questions.length}] answered by card click: ${value.label}`)
     return {
-      toast: { type: 'success', content: `✅ 已选择：${truncate(label, 20)}` },
+      toast: {
+        type: 'success',
+        content: more
+          ? `✅ 已选择：${truncate(value.label, 16)}，请回答下一题`
+          : `✅ 已选择：${truncate(value.label, 20)}`,
+      },
       ...card === undefined ? {} : { card: { type: 'raw', data: card } },
     }
+  }
+
+  /**
+   * Record the answer to the question at `pending.currentIndex`, then either
+   * advance to the next question (patch the answered card to its decided state
+   * and push the next question's card) or settle the whole request when the
+   * last question was answered. Returns the decided card for the answered
+   * question so the click/text response can apply it instantly.
+   */
+  private answerCurrentQuestion(
+    pending: PendingQuestion,
+    answer: { selected: string[]; custom?: string },
+  ): CardBody | undefined {
+    const draft = pending.drafts[pending.currentIndex] ??= { selected: [] }
+    draft.selected = answer.selected
+    if (answer.custom !== undefined) draft.custom = answer.custom
+    const label = draft.selected.length > 0 ? draft.selected.join('、') : (draft.custom ?? '已作答')
+    const decided = this.buildDecidedCard('❓ 问答', `你的选择：**${truncate(escapeMd(label), 60)}**`, 'green')
+    const answers = (): AskUserQuestionAnswer => ({
+      answers: pending.drafts.map((d, i) => ({
+        id: pending.questions[i].id,
+        selected: d.selected,
+        custom: d.custom,
+      })),
+    })
+    if (pending.currentIndex < pending.questions.length - 1) {
+      if (pending.cardMessageId) {
+        void this.deps.feishu.patchCard(pending.cardMessageId, decided).catch(() => undefined)
+      }
+      pending.currentIndex += 1
+      void this.pushQuestionCard(pending, pending.currentIndex).catch((err) => {
+        logger.error('interactions', 'push next question card failed:', err)
+        // Never leave the tool call hanging: settle with the answers collected
+        // so far (unanswered questions come back empty).
+        this.settleQuestionNow(pending, answers())
+      })
+    } else {
+      this.settleQuestionNow(pending, answers())
+    }
+    return decided
   }
 
   private settleQuestionNow(pending: PendingQuestion, answer: AskUserQuestionAnswer): CardBody | undefined {
@@ -414,8 +490,10 @@ export class InteractionService {
     pending.onAbort?.()
     this.questions.delete(pending.id)
     pending.resolve(answer)
-    const selected = answer.answers[0]?.selected ?? []
-    const label = selected.length > 0 ? selected.join('、') : (answer.answers[0]?.custom ?? '已作答')
+    // Multi-question flows settle on the last card, so show the last answer.
+    const last = answer.answers[answer.answers.length - 1]
+    const selected = last?.selected ?? []
+    const label = selected.length > 0 ? selected.join('、') : (last?.custom ?? '已作答')
     const card = this.buildDecidedCard('❓ 问答', `你的选择：**${truncate(escapeMd(label), 60)}**`, 'green')
     if (pending.cardMessageId) {
       void this.deps.feishu.patchCard(pending.cardMessageId, card).catch(() => undefined)
