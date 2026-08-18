@@ -38,6 +38,10 @@ push.
   removed, result shown) plus a toast confirmation.
 - ✍️ **Markdown replies** — plain rich-text (`post`) messages with the `md`
   tag: bold, inline code, lists and links render natively, no cards needed
+- 🧩 **Web-only interactive fences degrade gracefully** — model-emitted
+  `dsh-ui` interactive UI fences (e.g. from dsh-genui) only render in the Web
+  UI; on Feishu they are auto-downgraded to a one-line readable hint (title
+  extracted, "view in Web UI"), never a raw JSON code block
 - 🤖 **Full agent capability** — the DSH agent runs with its own model and
   tools (bash, files, subagents…), fully autonomous
 - 📨 **Proactive push** — optional admin HTTP API (`/api/push`) to push text /

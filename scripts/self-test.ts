@@ -6,7 +6,7 @@
  */
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { extractText, cleanText, summarize, ChatHandler } from '../src/chat.js'
+import { extractText, cleanText, summarize, ChatHandler, degradeGenUIFences } from '../src/chat.js'
 import { splitMarkdown } from '../src/feishu.js'
 import { SessionMap, conversationKey } from '../src/session-map.js'
 import { InteractionService } from '../src/interactions.js'
@@ -612,6 +612,28 @@ async function testUserQuestionsBridge(): Promise<void> {
   ok('dispose 后桥接移除（不再推飞书卡片）', calls.filter((c) => c.kind === 'push').length === 0)
 }
 
+async function testGenUIFences(): Promise<void> {
+  console.log('\n[6.6] dsh-ui 围栏降级（飞书渠道）')
+  const plain = '正常回答文字。'
+  ok('无围栏时原样', degradeGenUIFences(plain) === plain)
+
+  const withTitle = `分析如下。\n\n\`\`\`dsh-ui\n{"title":"销售趋势面板","items":[{"type":"chart","data":[]}]}\n\`\`\`\n\n以上。`
+  const d1 = degradeGenUIFences(withTitle)
+  ok('围栏替换为可读行并保留标题', d1.includes('销售趋势面板') && d1.includes('请在 Web UI 查看') && !d1.includes('dsh-ui'), `got=${d1}`)
+  ok('围栏前后文字保留', d1.startsWith('分析如下。') && d1.endsWith('以上。'))
+
+  const noTitle = `正文\n\`\`\`dsh-ui\n{"items":[{"type":"mermaid","title":"流程"}]}\n\`\`\`\n结尾`
+  const d2 = degradeGenUIFences(noTitle)
+  ok('无顶层标题时取首组件标题', d2.includes('流程'))
+
+  const badJson = `正文\n\`\`\`dsh-ui\n{ broken json\n\`\`\`\n`
+  const d3 = degradeGenUIFences(badJson)
+  ok('JSON 损坏时给通用提示', d3.includes('交互组件') && !d3.includes('broken json'))
+
+  const none = `\`\`\`ts\nconst x = 1\n\`\`\`\n`
+  ok('非 dsh-ui 围栏不受影响', degradeGenUIFences(none) === none)
+}
+
 async function main(): Promise<void> {
   testParsing()
   testSplit()
@@ -620,6 +642,7 @@ async function main(): Promise<void> {
   await testChatHandler()
   await testInteractions()
   await testUserQuestionsBridge()
+  await testGenUIFences()
   await testAcquisition()
   console.log(`\n自测完成：${passed} 项通过${process.exitCode ? '（有失败）' : ''}`)
 }

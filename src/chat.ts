@@ -94,6 +94,56 @@ export function cleanText(text: string): string {
     .trim()
 }
 
+/**
+ * Downgrade `dsh-ui` interactive fences (emitted by @omdsh-dev/dsh-genui) to a
+ * readable one-line fallback. Those fences only render in a browser renderer
+ * (the Web UI); sent verbatim over a Markdown post / Feishu they would appear
+ * as a raw JSON code block. When the spec's `title` (or the first item's
+ * `title`/`type`) parses, the fallback names the component; otherwise a generic
+ * note points the user to the Web UI.
+ */
+export function degradeGenUIFences(text: string): string {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]!
+    const fenceMatch = /^\s*```\s*dsh-ui\s*$/.exec(line)
+    if (fenceMatch === null) {
+      out.push(line)
+      i += 1
+      continue
+    }
+    // Consume everything up to the closing fence (or end of text).
+    i += 1
+    let json = ''
+    while (i < lines.length && !/^\s*```\s*$/.test(lines[i]!)) {
+      json += lines[i]! + '\n'
+      i += 1
+    }
+    i += 1 // skip the closing ``` if present
+    out.push(`📊 ${genUiFallback(json)} —— 交互组件请在 Web UI 查看`)
+  }
+  return out.join('\n')
+}
+
+/** Human-readable name for one `dsh-ui` spec (best-effort; never throws). */
+function genUiFallback(json: string): string {
+  try {
+    const spec = JSON.parse(json) as {
+      title?: unknown
+      items?: Array<{ type?: unknown; title?: unknown }>
+    }
+    if (typeof spec.title === 'string' && spec.title.trim() !== '') return spec.title.trim()
+    const first = spec.items?.[0]
+    if (typeof first?.title === 'string' && first.title.trim() !== '') return first.title.trim()
+    if (typeof first?.type === 'string') return `交互组件（${first.type}）`
+  } catch {
+    // fall through to the generic note
+  }
+  return '模型输出了一个交互组件'
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
@@ -243,10 +293,14 @@ export class ChatHandler {
       const outcome = await this.runTurn(sessionId, text, cwd, reporter)
 
       const failed = outcome.reason?.kind === 'error'
+      // Downgrade `dsh-ui` fences (Web-only interactive UI) to a readable line
+      // before anything reaches Feishu — both the streaming summary card and
+      // the final Markdown reply.
+      const degraded = degradeGenUIFences(outcome.text)
       await this.finishTyping(messageId, failed)
       if (reporter) {
         await reporter
-          .finish({ text: outcome.text, error: failed })
+          .finish({ text: degraded, error: failed })
           .catch((err) => logger.warn('chat', 'reporter finish error:', err))
       }
 
@@ -258,7 +312,7 @@ export class ChatHandler {
         await feishu.replyText(messageId, `😵 DSH 处理失败：${detail}`)
         return
       }
-      const answer = outcome.text.trim()
+      const answer = degraded.trim()
       if (!answer) {
         await feishu.replyText(messageId, '😶 DSH 没有返回内容，请再试一次。')
         return
