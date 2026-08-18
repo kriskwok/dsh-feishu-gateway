@@ -536,6 +536,82 @@ async function testAcquisition(): Promise<void> {
   }
 }
 
+async function testUserQuestionsBridge(): Promise<void> {
+  console.log('\n[6.5] userQuestions 服务边界桥接（web profile 竞态回归）')
+  // 单槽位 provider 服务的最小替身：registerProvider 唯一、ask 可被覆盖。
+  let webProvider: { ask: (r: { questions: Array<{ options?: Array<{ label: string }> }> }) => Promise<{ answers: unknown[] }> } | undefined
+  let askImpl: (r: unknown) => Promise<unknown> = (r) => {
+    if (webProvider === undefined) return Promise.reject(new Error('NO_PROVIDER'))
+    return webProvider.ask(r as never)
+  }
+  const service = {
+    registerProvider(p: { ask: (r: unknown) => Promise<unknown> }) {
+      if (webProvider !== undefined) throw new Error('DUPLICATE_PROVIDER')
+      webProvider = p as never
+      return () => { webProvider = undefined }
+    },
+    get ask() { return askImpl },
+    set ask(fn: (r: unknown) => Promise<unknown>) { askImpl = fn },
+  }
+
+  const file = path.join(os.tmpdir(), `uqbridge-${Date.now()}.json`)
+  const sessions = new SessionMap(file)
+  const key = conversationKey('oc_p2p', 'p2p', 'ou_user')
+  const sessionId = sessions.idFor(key)
+  sessions.recordSession(key, sessionId, { key, chatId: 'oc_p2p', chatType: 'p2p', userOpenId: 'ou_user' })
+
+  const calls: Array<{ kind: string; args: unknown[] }> = []
+  const feishuMock = {
+    push: async (opts: { content: string }) => { calls.push({ kind: 'push', args: [opts] }); return `card-${calls.length}` },
+    patchCard: async () => undefined,
+    deleteMessage: async () => true,
+  } as never
+
+  const ctx = {
+    get: (name: string) => (name === 'userQuestions' ? service : undefined),
+    on: () => () => {},
+  } as never
+  const svc = new InteractionService({ ctx, config: {}, feishu: feishuMock, sessions })
+  svc.registerUserQuestionsProvider()
+  ok('桥接已安装（service.ask 被覆盖）', typeof service.ask === 'function' && Object.prototype.hasOwnProperty.call(service, 'ask'))
+
+  // 网关之后 Web UI provider 再注册 → 必须不抛（0.2.6 之前网关抢先占槽导致 DUPLICATE_PROVIDER）
+  let registered = true
+  try {
+    service.registerProvider({ ask: async (r) => ({ answers: [{ id: 'w1', selected: [(r as { questions: Array<{ options: Array<{ label: string }> }> }).questions[0]!.options[0]!.label] }] }) })
+  } catch {
+    registered = false
+  }
+  ok('Web provider 在网关之后注册不抛 DUPLICATE_PROVIDER', registered)
+
+  // 飞书会话提问 → 推卡片
+  calls.length = 0
+  const pending = service.ask({
+    questions: [{ id: 'q1', question: '选方案', options: [{ label: 'A' }, { label: 'B' }] }],
+    agent: { id: sessionId },
+  })
+  await new Promise((r) => setTimeout(r, 10))
+  ok('飞书会话提问推送交互卡片', calls.some((c) => c.kind === 'push' && (c.args[0] as { msgType?: string }).msgType === 'interactive'))
+
+  // 非飞书会话提问 → 委托给 Web provider，不推卡片
+  calls.length = 0
+  const webAnswer = await service.ask({
+    questions: [{ id: 'w1', question: 'web?', options: [{ label: 'x' }] }],
+    agent: { id: 'other-session' },
+  })
+  ok('非飞书会话委托 Web provider', JSON.stringify(webAnswer) === JSON.stringify({ answers: [{ id: 'w1', selected: ['x'] }] }))
+  ok('非飞书会话未推飞书卡片', calls.filter((c) => c.kind === 'push').length === 0)
+
+  svc.dispose()
+  // dispose 后桥接移除：飞书会话提问不再推卡片（回到原始 ask 行为）
+  calls.length = 0
+  await service.ask({
+    questions: [{ id: 'q1', question: '选方案', options: [{ label: 'A' }] }],
+    agent: { id: sessionId },
+  }).catch(() => undefined)
+  ok('dispose 后桥接移除（不再推飞书卡片）', calls.filter((c) => c.kind === 'push').length === 0)
+}
+
 async function main(): Promise<void> {
   testParsing()
   testSplit()
@@ -543,6 +619,7 @@ async function main(): Promise<void> {
   testSummarize()
   await testChatHandler()
   await testInteractions()
+  await testUserQuestionsBridge()
   await testAcquisition()
   console.log(`\n自测完成：${passed} 项通过${process.exitCode ? '（有失败）' : ''}`)
 }

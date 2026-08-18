@@ -11,12 +11,12 @@
  *    sessions this gateway does not own are delegated via `next()` so the web
  *    UI (or the fail-closed default) still answers them.
  * 2. **The model's `ask_user_question` tool** — via `ctx.userQuestions`. The
- *    gateway registers itself as the user-questions provider when the slot is
- *    free (standalone profile). In a web profile the DSH Web UI already owns
- *    the single provider slot, so the gateway keeps that provider alive and
- *    bridges at the service boundary: sessions owned by a Feishu conversation
- *    are answered with Feishu cards, every other session continues through the
- *    Web UI provider. Questions with options render clickable option buttons;
+ *    gateway never claims the single UI-provider slot (in a web profile that
+ *    slot belongs to the DSH Web UI, and stealing it makes the apiProxy host
+ *    fail with `DUPLICATE_PROVIDER`); it wraps `service.ask` at the service
+ *    boundary instead: sessions owned by a Feishu conversation are answered
+ *    with Feishu cards, every other session continues through the registered
+ *    UI provider. Questions with options render clickable option buttons;
  *    option-less questions are answered by replying with text in the chat.
  *    Multi-question requests advance one card per question and settle once the
  *    last question is answered.
@@ -159,10 +159,19 @@ export class InteractionService {
   }
 
   /**
-   * Register the Feishu question provider. In the Web profile the official UI
-   * provider is already installed, so registering a second provider is rejected
-   * by DSH. Wrap `ask()` in that case and route only Feishu-owned sessions to
-   * cards; all other sessions continue through the Web UI provider.
+   * Bridge `ctx.userQuestions` at the service boundary: Feishu-owned sessions
+   * answer via Feishu cards, every other session continues through the
+   * registered UI provider (the Web UI in a web profile).
+   *
+   * The gateway deliberately never claims the single provider slot. Cordis
+   * activation is dependency-driven, and the gateway's inject deps are all
+   * base-bundle services — in a web profile its `apply` runs BEFORE the web
+   * api-gateway row, so `registerProvider` would SUCCEED here, silently
+   * stealing the slot from the Web UI. The apiProxy host's own
+   * `registerProvider` then throws `DUPLICATE_PROVIDER` in its constructor
+   * and the whole web tree fails to activate. Wrapping `service.ask` instead
+   * works in every activation order and in both the standalone and web
+   * profiles, without disturbing the UI provider.
    */
   registerUserQuestionsProvider(): void {
     const enabled = this.deps.config.interactions?.userQuestionsCards ?? true
@@ -172,33 +181,28 @@ export class InteractionService {
       logger.warn('interactions', 'ctx.userQuestions unavailable; Feishu card Q&A disabled')
       return
     }
-    const provider = { ask: (request: AskUserQuestionRequest) => this.askUser(request) }
-    try {
-      const dispose = service.registerProvider(provider)
-      this.disposers.push(dispose)
-      logger.info('interactions', 'registered as ctx.userQuestions provider (Feishu card Q&A)')
-      return
-    } catch (err) {
-      // The Web UI owns the single provider in a web profile. Keep that
-      // provider alive and multiplex at the service boundary instead of
-      // silently losing Feishu questions.
-      const originalAsk = service.ask.bind(service)
-      const bridgedAsk = (request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> => {
-        const sessionId = request.agent?.id
-        return sessionId !== undefined && this.resolveConversation(sessionId) !== undefined
-          ? this.askUser(request)
-          : originalAsk(request)
-      }
-      const mutableService = service as typeof service & { ask: typeof service.ask }
-      mutableService.ask = bridgedAsk
-      this.disposers.push(() => {
-        if (mutableService.ask === bridgedAsk) mutableService.ask = originalAsk
-      })
+    const originalAsk = service.ask.bind(service)
+    const bridgedAsk = (request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> => {
+      const sessionId = request.agent?.id
+      const conv = sessionId === undefined ? undefined : this.resolveConversation(sessionId)
+      // Diagnostic: which branch each ask takes and why.
       logger.info(
         'interactions',
-        `ctx.userQuestions provider already registered; Feishu sessions bridged alongside Web UI: ${err instanceof Error ? err.message : String(err)}`,
+        `ask_user_question routed: session=${sessionId ?? '(none)'} feishuConv=${conv === undefined ? 'NO' : 'yes'} → ${sessionId !== undefined && conv !== undefined ? 'feishu-card' : 'delegate-to-UI'}`,
       )
+      return sessionId !== undefined && conv !== undefined
+        ? this.askUser(request)
+        : originalAsk(request)
     }
+    const mutableService = service as typeof service & { ask: typeof service.ask }
+    mutableService.ask = bridgedAsk
+    this.disposers.push(() => {
+      if (mutableService.ask === bridgedAsk) mutableService.ask = originalAsk
+    })
+    logger.info(
+      'interactions',
+      'ctx.userQuestions bridged at the service boundary (Feishu sessions answer via cards)',
+    )
   }
 
   dispose(): void {
@@ -513,6 +517,10 @@ export class InteractionService {
     const store = this.deps.ctx.get('sessions') as
       | { get(id: unknown): { header: { parentSession?: unknown } } | undefined }
       | undefined
+    if (store === undefined) {
+      logger.warn('interactions', `resolveConversation(${sessionId}): direct map miss and ctx.sessions unavailable — cannot answer as Feishu`)
+      return undefined
+    }
     let cursor: string | undefined = sessionId
     for (let hop = 0; hop < MAX_LINEAGE_HOPS && cursor !== undefined; hop += 1) {
       const current: { header: { parentSession?: unknown } } | undefined = store?.get(cursor)
@@ -524,6 +532,7 @@ export class InteractionService {
       if (conv !== undefined) return conv
       cursor = parentId
     }
+    logger.warn('interactions', `resolveConversation(${sessionId}): not a Feishu-owned session (direct+lineage miss, store=${store !== undefined})`)
     return undefined
   }
 
