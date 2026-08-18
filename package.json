@@ -1,6 +1,6 @@
 {
   "name": "@kriskwok/dsh-feishu-gateway",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "DeepSeek Harness-native Feishu (Lark) gateway: chat with the DSH agent from Feishu via long connection, with persistent sessions, /new, Markdown replies, live streaming progress cards, native Typing reactions, click-to-answer approval / Q&A cards, and proactive push.",
   "keywords": [
     "deepseek",

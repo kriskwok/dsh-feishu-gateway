@@ -453,16 +453,21 @@ export class ChatHandler {
   }
 
   /**
-   * Best-effort Workspace membership: after a turn runs on a session, resolve
-   * the Workspace owning the session's cwd and attach the session to it so the
-   * Web UI groups it under that Workspace rather than "Ungrouped".
+   * Best-effort Workspace membership: after acquiring a session, check whether
+   * a Workspace is ALREADY registered at the session's cwd (e.g. the user's
+   * DSH-Workspace) and attach the session to it so the Web UI groups it under
+   * that Workspace rather than "Ungrouped".
    *
    * The workspace registry is exposed by the host as `ctx.workspaceRegistry`
-   * (web profile and other workspace-aware deployments). Standalone
-   * / rosterless deployments that lack it skip this silently. Both the
-   * resolve and the attach are validated by the registry against the session's
-   * stored header cwd, so a mismatched or missing cwd simply no-ops — the
-   * session stays where the host puts it.
+   * (web profile and other workspace-aware deployments). Standalone /
+   * rosterless deployments that lack it skip this silently.
+   *
+   * If the user has no Workspace at that cwd (a different DSH-Workspace path,
+   * or none at all — `~/Documents/DSH-Workspace` is only a default, other
+   * machines may not have it), `resolveByPath` returns `undefined` and the
+   * session stays Ungrouped. `resolveByPath` never creates a Workspace, so we
+   * never invent a grouping the user didn't set up. A cwd whose directory
+   * doesn't exist yet is the same normal "no Workspace" case and is silent.
    */
   private async ensureWorkspaceMembership(sessionId: string, cwd: string): Promise<void> {
     const ctx = this.deps.ctx
@@ -470,9 +475,16 @@ export class ChatHandler {
       resolveByPath(path: string): Promise<{ attachSession(id: string): Promise<void> } | undefined>
     } | undefined
     if (registry === undefined || typeof registry.resolveByPath !== 'function') return
+    let workspace: { attachSession(id: string): Promise<void> } | undefined
     try {
-      const workspace = await registry.resolveByPath(cwd)
-      if (workspace === undefined) return
+      workspace = await registry.resolveByPath(cwd)
+    } catch {
+      // cwd does not resolve to an existing directory → no Workspace can own
+      // it → stay Ungrouped. Expected for users without that folder; silent.
+      return
+    }
+    if (workspace === undefined) return
+    try {
       await workspace.attachSession(sessionId)
       logger.info('chat', `session ${sessionId} attached to workspace ${cwd}`)
     } catch (err) {
