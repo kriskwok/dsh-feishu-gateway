@@ -185,7 +185,7 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 | `reporting.typingReaction` | `true` | Show the native Feishu `Typing` reaction while working |
 | `reporting.showReasoning` | `true` | Stream the model's reasoning in the card |
 | `reporting.showToolCalls` | `true` | Stream tool-call activity in the card |
-| `reporting.patchIntervalMs` | `700` | Min interval between card patches (Feishu rate limit) |
+| `reporting.patchIntervalMs` | `1100` | Min interval between card patches; Feishu limits single-message updates to ~1/s (error 230020), and the stream backs off adaptively on failure |
 | `reporting.maxBodyChars` | `900` | Max rendered card body length |
 | `reporting.failureReaction` | `CrossMark` | Reaction added on failure (after removing `Typing`) |
 | `reporting.cardTitleStreaming` | `🤖 DSH 处理中…` | Custom title of the streaming card while working (yellow header) |
@@ -199,13 +199,14 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 | `http.token` | `` | Admin API bearer token |
 
 > **Q&A cards in the web profile**: `ask_user_question` answers go through the
-> single `ctx.userQuestions` provider slot, which the DSH Web UI owns when it
-> runs in the same process (recommended setup). The gateway keeps that provider
-> and bridges at the service boundary: sessions owned by a Feishu conversation
-> are answered with Feishu cards, while every other session continues through
-> the Web UI provider. Permission-approval cards work from Feishu in every
-> setup. In a standalone feishu profile, both `ask_user_question` and approvals
-> are answered from Feishu cards.
+> single `ctx.userQuestions` provider slot. The gateway never claims that slot
+> (stealing it makes the Web UI's apiProxy host fail to start with
+> `DUPLICATE_PROVIDER`); it wraps `service.ask` at the service boundary
+> instead: sessions owned by a Feishu conversation are answered with Feishu
+> cards, while every other session continues through the registered UI
+> provider. Permission-approval cards work from Feishu in every setup. In a
+> standalone feishu profile, both `ask_user_question` and approvals are
+> answered from Feishu cards.
 
 ## Session coexistence & self-healing
 

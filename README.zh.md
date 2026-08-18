@@ -167,7 +167,7 @@ dsh --profile feishu
 | `reporting.typingReaction` | `true` | 处理中显示原生 Typing 表情 |
 | `reporting.showReasoning` | `true` | 卡片中流式显示模型思考 |
 | `reporting.showToolCalls` | `true` | 卡片中流式显示工具调用 |
-| `reporting.patchIntervalMs` | `700` | 卡片刷新最小间隔（毫秒，飞书有限流） |
+| `reporting.patchIntervalMs` | `1100` | 卡片刷新最小间隔（毫秒）；飞书单条消息更新约限 1 次/秒（错误 230020），失败会自动退避 |
 | `reporting.maxBodyChars` | `900` | 卡片正文最大渲染长度 |
 | `reporting.failureReaction` | `CrossMark` | 失败时（移除 Typing 后）追加的表情 |
 | `reporting.cardTitleStreaming` | `🤖 DSH 处理中…` | 处理中卡片标题（黄色头）可自定义 |
@@ -181,11 +181,11 @@ dsh --profile feishu
 | `http.token` | 空 | 管理 API Bearer Token |
 
 > **web profile 下的问答卡片**：`ask_user_question` 的作答走唯一的
-> `ctx.userQuestions` provider 槽位。当 Web UI 与网关同进程（推荐部署）时该槽位
-> 归 Web UI，网关会保留该 provider 并在服务边界做桥接：**飞书会话的提问用飞书
-> 卡片作答**，其余会话继续走 Web UI provider。**权限审批卡片在任何部署下都从
-> 飞书作答**。独立 feishu profile 下，`ask_user_question` 与审批都在飞书卡片中
-> 作答。
+> `ctx.userQuestions` provider 槽位。网关**从不抢占**该槽位（否则 Web UI 的
+> apiProxy 宿主会因 `DUPLICATE_PROVIDER` 启动失败）——它在服务边界包裹
+> `service.ask` 做桥接：**飞书会话的提问用飞书卡片作答**，其余会话继续走
+> Web UI provider。**权限审批卡片在任何部署下都从飞书作答**。独立 feishu
+> profile 下，`ask_user_question` 与审批都在飞书卡片中作答。
 
 ## 会话共存与自愈
 
