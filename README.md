@@ -179,7 +179,7 @@ All settings live in the `feishu-gateway` namespace (profile patch row or
 | `feishu.domain` | `feishu` | `feishu` (CN) or `lark` (international) |
 | `feishu.botOpenId` | `` | Optional; @-detection works without it |
 | `feishu.replyMode` | `at` | Group policy: `at` or `all` |
-| `workspace` | `~/Documents/DSH-Workspace` | Agent working directory |
+| `workspace` | `~/Documents/DSH-Workspace` | Agent working directory (the session is also auto-attached to the matching DSH Workspace, so it groups under that Workspace in the Web UI instead of "Ungrouped") |
 | `hintText` | `爸爸，我正在努力处理中……` | Fallback "processing" text (only when the Typing reaction is disabled/unavailable) |
 | `reporting.mode` | `stream` | `stream` = live streaming progress card; `final` = only the final answer |
 | `reporting.typingReaction` | `true` | Show the native Feishu `Typing` reaction while working |

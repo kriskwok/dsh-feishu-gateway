@@ -161,7 +161,7 @@ dsh --profile feishu
 | `feishu.domain` | `feishu` | `feishu`（国内）/ `lark`（海外） |
 | `feishu.botOpenId` | 空 | 可选；@ 识别可自动完成 |
 | `feishu.replyMode` | `at` | 群聊策略：`at` 仅被 @ 回复 / `all` 全部回复 |
-| `workspace` | `~/Documents/DSH-Workspace` | agent 工作目录 |
+| `workspace` | `~/Documents/DSH-Workspace` | agent 工作目录（会话也会自动挂到对应的 DSH 工作区，在 Web UI 里归入该工作区而非"未分组"） |
 | `hintText` | `爸爸，我正在努力处理中……` | 兜底"处理中"文案（仅当 Typing 表情被禁用/不可用时） |
 | `reporting.mode` | `stream` | `stream`=流式进度卡片；`final`=只显示最终结果 |
 | `reporting.typingReaction` | `true` | 处理中显示原生 Typing 表情 |

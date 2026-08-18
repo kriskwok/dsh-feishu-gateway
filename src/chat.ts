@@ -306,6 +306,11 @@ export class ChatHandler {
   ): Promise<TurnOutcome> {
     const acquired = await this.acquireAgent(sessionId, cwd)
     const { agent, dispose } = acquired
+    // Best-effort: attach the session to the Workspace owning its cwd so the
+    // Web UI groups it there instead of "Ungrouped". Uses the actual acquired
+    // session id (a wedged identity may have remapped to a fresh one). Runs
+    // before the turn so a takeover of a Web-UI session stays put too.
+    await this.ensureWorkspaceMembership(agent.session.id, cwd)
     const ctx = this.deps.ctx
     let disposeListener: (() => void) | undefined
     try {
@@ -444,6 +449,34 @@ export class ChatHandler {
         if (!defaultResolved && recorded === undefined) return
         await presets.mount(agentCtx, recorded)
       },
+    }
+  }
+
+  /**
+   * Best-effort Workspace membership: after a turn runs on a session, resolve
+   * the Workspace owning the session's cwd and attach the session to it so the
+   * Web UI groups it under that Workspace rather than "Ungrouped".
+   *
+   * The workspace registry is exposed by the host as `ctx.workspaceRegistry`
+   * (web profile and other workspace-aware deployments). Standalone
+   * / rosterless deployments that lack it skip this silently. Both the
+   * resolve and the attach are validated by the registry against the session's
+   * stored header cwd, so a mismatched or missing cwd simply no-ops — the
+   * session stays where the host puts it.
+   */
+  private async ensureWorkspaceMembership(sessionId: string, cwd: string): Promise<void> {
+    const ctx = this.deps.ctx
+    const registry = ctx.get('workspaceRegistry') as {
+      resolveByPath(path: string): Promise<{ attachSession(id: string): Promise<void> } | undefined>
+    } | undefined
+    if (registry === undefined || typeof registry.resolveByPath !== 'function') return
+    try {
+      const workspace = await registry.resolveByPath(cwd)
+      if (workspace === undefined) return
+      await workspace.attachSession(sessionId)
+      logger.info('chat', `session ${sessionId} attached to workspace ${cwd}`)
+    } catch (err) {
+      logger.warn('chat', `attach session ${sessionId} to workspace ${cwd} failed:`, err)
     }
   }
 
